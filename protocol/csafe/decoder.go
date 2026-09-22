@@ -8,36 +8,20 @@ import (
 type Decoder struct {
 }
 
-// Decode decodes the raw csafe-encoded data.
+// Decode decodes the raw csafe-encoded data, treating the whole frame as a
+// single command (with optional trailing data). This preserves the original
+// decoding behavior and is kept for backward compatibility; frames that chain
+// multiple commands together should use DecodeAll instead.
 func (d *Decoder) Decode(raw []byte) (*Packet, error) {
-
-	if len(raw) < 4 {
-		return nil, errors.New("raw data length less than minimum length")
-	}
-
-	// Remove frame start and end bytes
-	body, err := d.stripHeadTail(raw)
+	pck, err := d.decodeFrame(raw)
 	if err != nil {
 		return nil, err
-	}
-
-	// Perform reverse byte-stuffing
-	pck, err := d.unstuff(body)
-	if err != nil {
-		return nil, err
-	}
-
-	// Check the checksum
-	dta := pck[0 : len(pck)-1]
-	checksum := calculateChecksum(dta)
-	if checksum != pck[len(pck)-1] {
-		return nil, errors.New("checksum mismatched")
 	}
 
 	// Extract Command
 	cmd := pck[0]
 
-	if len(pck) == 2 {
+	if len(pck) == 1 {
 		// Command only
 		p := &Packet{
 			Data:    nil,
@@ -63,6 +47,73 @@ func (d *Decoder) Decode(raw []byte) (*Packet, error) {
 	}
 
 	return p, nil
+}
+
+// DecodeAll decodes a raw csafe-encoded frame that may chain several
+// commands together, as real CSAFE clients (e.g. ErgData) commonly do. Each
+// command becomes its own Packet, in the order it appeared in the frame.
+// Short commands (cmd&SHORT_CMD_TYPE_MSK != 0) carry no data; long commands
+// are followed by a byte count and that many data bytes.
+func (d *Decoder) DecodeAll(raw []byte) ([]*Packet, error) {
+	dta, err := d.decodeFrame(raw)
+	if err != nil {
+		return nil, err
+	}
+
+	var packets []*Packet
+	for i := 0; i < len(dta); {
+		cmd := dta[i]
+
+		if cmd&SHORT_CMD_TYPE_MSK != 0 {
+			packets = append(packets, &Packet{Data: nil, Cmds: []byte{cmd}, JustCmd: true})
+			i++
+			continue
+		}
+
+		if i+1 >= len(dta) {
+			return nil, errors.New("truncated long command: missing byte count")
+		}
+		dataLen := int(dta[i+1])
+		if i+2+dataLen > len(dta) {
+			return nil, errors.New("truncated long command: data length exceeds frame")
+		}
+
+		data := make([]byte, dataLen)
+		copy(data, dta[i+2:i+2+dataLen])
+		packets = append(packets, &Packet{Data: data, Cmds: []byte{cmd}, JustCmd: false})
+		i += 2 + dataLen
+	}
+
+	return packets, nil
+}
+
+// decodeFrame strips framing, reverses byte-stuffing and validates the
+// checksum, returning the command+data bytes (without the checksum byte).
+func (d *Decoder) decodeFrame(raw []byte) ([]byte, error) {
+	if len(raw) < 4 {
+		return nil, errors.New("raw data length less than minimum length")
+	}
+
+	// Remove frame start and end bytes
+	body, err := d.stripHeadTail(raw)
+	if err != nil {
+		return nil, err
+	}
+
+	// Perform reverse byte-stuffing
+	pck, err := d.unstuff(body)
+	if err != nil {
+		return nil, err
+	}
+
+	// Check the checksum
+	dta := pck[0 : len(pck)-1]
+	checksum := calculateChecksum(dta)
+	if checksum != pck[len(pck)-1] {
+		return nil, errors.New("checksum mismatched")
+	}
+
+	return dta, nil
 }
 
 // stripHeadTail removes the framing head and tail bytes.

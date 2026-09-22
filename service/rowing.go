@@ -1,18 +1,21 @@
 package service
 
 import (
-	"pm5-emulator/service/mux"
-	"github.com/sirupsen/logrus"
-	"github.com/bettercap/gatt"
+	"sync/atomic"
 	"time"
-	"crypto/rand"
+
+	"pm5-emulator/protocol/rowing"
+	"pm5-emulator/simulator"
+
+	"github.com/bettercap/gatt"
+	"github.com/sirupsen/logrus"
 )
 
 /*
 	C2 rowing primary service
 */
 
-//C2 rowing primary service and characteristics UUIDs
+// C2 rowing primary service and characteristics UUIDs
 var (
 	attrRowingServiceUUID, _                                    = gatt.ParseUUID(getFullUUID("0030"))
 	attrGeneralStatusCharacteristicsUUID, _                     = gatt.ParseUUID(getFullUUID("0031"))
@@ -30,29 +33,71 @@ var (
 	attrMultiplexedInfoCharacteristicsUUID, _                   = gatt.ParseUUID(getFullUUID("0080"))
 )
 
-//NewRowingService advertises rowing service defined by PM5 device
-func NewRowingService() *gatt.Service {
+// sampleRate codes and their notify intervals, per the PM5 BLE spec's
+// 0x0034 characteristic (0=1s, 1=500ms default, 2=250ms, 3=100ms).
+var sampleIntervals = map[byte]time.Duration{
+	0: 1 * time.Second,
+	1: 500 * time.Millisecond,
+	2: 250 * time.Millisecond,
+	3: 100 * time.Millisecond,
+}
+
+const defaultSampleRateCode = 1
+
+// notifyLoop repeatedly writes encode(sim.Snapshot()) to n at the current
+// sample-rate interval until the client unsubscribes (gatt.Notifier.Done()).
+func notifyLoop(n gatt.Notifier, sim *simulator.Simulator, sampleRateCode *uint32, encode func(simulator.LiveState) []byte) {
+	for {
+		if n.Done() {
+			return
+		}
+		interval, ok := sampleIntervals[byte(atomic.LoadUint32(sampleRateCode))]
+		if !ok {
+			interval = sampleIntervals[defaultSampleRateCode]
+		}
+		if _, err := writeNotification(n, encode(sim.Snapshot())); err != nil {
+			return
+		}
+		time.Sleep(interval)
+	}
+}
+
+// eventNotifyLoop writes encode(sim.Snapshot()) whenever an event fires on
+// events (a split boundary or workout-finished signal from the simulator),
+// until the client unsubscribes.
+func eventNotifyLoop(n gatt.Notifier, sim *simulator.Simulator, events <-chan struct{}, unsubscribe func(), encode func(simulator.LiveState) []byte) {
+	defer unsubscribe()
+	for {
+		if n.Done() {
+			return
+		}
+		select {
+		case <-events:
+			if _, err := writeNotification(n, encode(sim.Snapshot())); err != nil {
+				return
+			}
+		case <-time.After(200 * time.Millisecond):
+		}
+	}
+}
+
+// NewRowingService advertises rowing service defined by PM5 device, backed by
+// sim: every characteristic reflects the same shared, physics-based workout
+// simulation rather than independent dummy data.
+func NewRowingService(sim *simulator.Simulator) *gatt.Service {
 	s := gatt.NewService(attrRowingServiceUUID)
+
+	// Sample rate, shared by every "on-tick" notify loop below.
+	var sampleRateCode uint32 = defaultSampleRateCode
 
 	/*
 		C2 rowing general status characteristic
 	*/
 	rowingGenStatusChar := s.AddCharacteristic(attrGeneralStatusCharacteristicsUUID)
-
-	rowingGenStatusChar.HandleNotifyFunc(
-		func(r gatt.Request, n gatt.Notifier) {
-			logrus.Info("General Status Char Notify Request - launching goroutine")
-			go func() {
-				for true {
-					logrus.Info("Sending General Status Char Notification from goroutine")
-					byteArray := make([]byte, 1)
-					rand.Read(byteArray)		
-					// 19 bytes		
-					n.Write([]byte{byteArray[0], 0x5, 0x5, 0x5, 0x5, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x5, 0x5, 0x5, 0x5})
-					time.Sleep(500 * time.Millisecond)
-				}
-			}()
-		})	
+	rowingGenStatusChar.HandleNotifyFunc(func(r gatt.Request, n gatt.Notifier) {
+		logrus.Info("General Status Char Notify Request - launching goroutine")
+		go notifyLoop(n, sim, &sampleRateCode, rowing.EncodeGeneralStatus)
+	})
 
 	/*
 		C2 rowing additional status 1 characteristic
@@ -60,13 +105,7 @@ func NewRowingService() *gatt.Service {
 	additionalStatus1Char := s.AddCharacteristic(attrAdditionalStatus1CharacteristicsUUID)
 	additionalStatus1Char.HandleNotifyFunc(func(r gatt.Request, n gatt.Notifier) {
 		logrus.Info("Additional Status 1 Char Notify Request - launching goroutine")
-		go func() {
-			for true {
-				logrus.Info("Sending Additional Status 1 Notification from goroutine")				
-				n.Write([]byte{0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0xff, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0xb8, 0xb, 0x0, 0x0, 0x0})
-				time.Sleep(500 * time.Millisecond)
-			}
-		}()	
+		go notifyLoop(n, sim, &sampleRateCode, rowing.EncodeAdditionalStatus1)
 	})
 
 	/*
@@ -75,15 +114,7 @@ func NewRowingService() *gatt.Service {
 	additionalStatus2Char := s.AddCharacteristic(attrAdditionalStatus2CharacteristicsUUID)
 	additionalStatus2Char.HandleNotifyFunc(func(r gatt.Request, n gatt.Notifier) {
 		logrus.Info("Additional Status 2 Char Notify Request - launching goroutine")
-		go func() {
-			for true {
-				logrus.Info("Sending Additional Status 2 Notification from goroutine")
-				byteArray := make([]byte, 1)
-				rand.Read(byteArray)				
-				n.Write([]byte{byteArray[0], 0x1, 0x2, 0x3, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0})
-				time.Sleep(500 * time.Millisecond)
-			}
-		}()	
+		go notifyLoop(n, sim, &sampleRateCode, rowing.EncodeAdditionalStatus2)
 	})
 
 	/*
@@ -92,31 +123,33 @@ func NewRowingService() *gatt.Service {
 	sampleRateChar := s.AddCharacteristic(attrSampleRateCharacteristicsUUID)
 	sampleRateChar.HandleReadFunc(func(rsp gatt.ResponseWriter, req *gatt.ReadRequest) {
 		logrus.Info("Sample Rate Char Read Request")
-		data := make([]byte, 1)
-		rsp.Write(data)
+		rsp.Write([]byte{byte(atomic.LoadUint32(&sampleRateCode))})
 	})
 
 	sampleRateChar.HandleWriteFunc(func(req gatt.Request, data []byte) (status byte) {
-		logrus.Info("Sample Rate Char Write Request: ", string(data))
-		if (len(data) > 1){
-			logrus.Error("Sample Rate Char Write Request received more than one byte")
+		logrus.Info("Sample Rate Char Write Request: ", data)
+		// Real clients (e.g. ErgData) may pad the write past 1 byte; only
+		// the first byte is meaningful. Reject only if it's empty or an
+		// unrecognized rate code, matching real PM5 leniency here.
+		if len(data) < 1 {
+			logrus.Error("Sample Rate Char Write Request: no data")
+			return gatt.StatusUnexpectedError
 		}
+		if _, ok := sampleIntervals[data[0]]; !ok {
+			logrus.Errorf("Sample Rate Char Write Request: unknown rate code %v", data[0])
+			return gatt.StatusUnexpectedError
+		}
+		atomic.StoreUint32(&sampleRateCode, uint32(data[0]))
 		return gatt.StatusSuccess
 	})
 
 	/*
-		C2 rowing stroke data  characteristic 0x0035
+		C2 rowing stroke data characteristic 0x0035
 	*/
 	strokeDataChar := s.AddCharacteristic(attrStrokeDataCharacteristicsUUID)
 	strokeDataChar.HandleNotifyFunc(func(r gatt.Request, n gatt.Notifier) {
 		logrus.Info("Stroke Data Char Notify Request - launching goroutine")
-		go func() {
-			for true {
-				logrus.Info("Stroke Data Notification from goroutine")
-				n.Write([]byte{0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0})
-				time.Sleep(1000 * time.Millisecond)
-			}
-		}()	
+		go notifyLoop(n, sim, &sampleRateCode, rowing.EncodeStrokeData)
 	})
 
 	/*
@@ -125,30 +158,19 @@ func NewRowingService() *gatt.Service {
 	additionalStrokeDataChar := s.AddCharacteristic(attrAdditionalStrokeDataCharacteristicsUUID)
 	additionalStrokeDataChar.HandleNotifyFunc(func(r gatt.Request, n gatt.Notifier) {
 		logrus.Info("Additional Stroke Data Char Notify Request - launching goroutine")
-		go func() {
-			for true {
-				logrus.Info("Stroke Data Notification from goroutine")
-				n.Write([]byte{0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0xff})
-				time.Sleep(1000 * time.Millisecond)
-			}
-		}()	
+		go notifyLoop(n, sim, &sampleRateCode, rowing.EncodeAdditionalStrokeData)
 	})
 
 	/*
-		C2 rowing split/interval data characteristic
+		C2 rowing split/interval data characteristic: fires on split
+		boundaries rather than a fixed timer.
 	*/
 	splitIntervalDataChar := s.AddCharacteristic(attrSplitIntervalDataCharacteristicsUUID)
 	splitIntervalDataChar.HandleNotifyFunc(func(r gatt.Request, n gatt.Notifier) {
 		logrus.Info("Split/Interval Data Char Notify Request - launching goroutine")
-		go func() {
-			for true {
-				logrus.Info("Split/Interval Data Notification from goroutine")
-				n.Write(make([]byte, 18))
-				time.Sleep(50000 * time.Millisecond)
-			}
-		}()	
+		splitEvents, _, unsubscribe := sim.Subscribe()
+		go eventNotifyLoop(n, sim, splitEvents, unsubscribe, rowing.EncodeSplitIntervalData)
 	})
-
 
 	/*
 		C2 rowing additional split/interval data characteristic
@@ -156,28 +178,19 @@ func NewRowingService() *gatt.Service {
 	additionalSplitIntervalDataChar := s.AddCharacteristic(attrAdditionalSplitIntervalDataCharacteristicsUUID)
 	additionalSplitIntervalDataChar.HandleNotifyFunc(func(r gatt.Request, n gatt.Notifier) {
 		logrus.Info("Additional Split/Interval Data Char Notify Request - launching goroutine")
-		go func() {
-			for true {
-				logrus.Info("Additional Split/Interval Data Notification from goroutine")
-				n.Write(make([]byte, 18))
-				time.Sleep(50000 * time.Millisecond)
-			}
-		}()	
+		splitEvents, _, unsubscribe := sim.Subscribe()
+		go eventNotifyLoop(n, sim, splitEvents, unsubscribe, rowing.EncodeAdditionalSplitIntervalData)
 	})
 
 	/*
-		C2 rowing end of workout summary data characteristic
+		C2 rowing end of workout summary data characteristic: fires once
+		the simulated workout finishes.
 	*/
 	endOfWorkoutSummaryDataChar := s.AddCharacteristic(attrEndOfWorkoutSummaryDataCharacteristicsUUID)
 	endOfWorkoutSummaryDataChar.HandleNotifyFunc(func(r gatt.Request, n gatt.Notifier) {
 		logrus.Info("End of workout summary Data Char Notify Request - launching goroutine")
-		go func() {
-			for true {
-				time.Sleep(200000 * time.Millisecond)
-				logrus.Info("End of workout summary Data Notification from goroutine")
-				n.Write(make([]byte, 20))
-			}
-		}()	
+		_, summaryEvents, unsubscribe := sim.Subscribe()
+		go eventNotifyLoop(n, sim, summaryEvents, unsubscribe, rowing.EncodeEndOfWorkoutSummary)
 	})
 
 	/*
@@ -186,61 +199,40 @@ func NewRowingService() *gatt.Service {
 	additionalEndOfWorkoutSummaryDataChar := s.AddCharacteristic(attrAdditionalEndOfWorkoutSummaryDataCharacteristicsUUID)
 	additionalEndOfWorkoutSummaryDataChar.HandleNotifyFunc(func(r gatt.Request, n gatt.Notifier) {
 		logrus.Info("End of workout Additional summary Data Char Notify Request - launching goroutine")
-		go func() {
-			for true {
-				time.Sleep(200000 * time.Millisecond)
-				logrus.Info("End of workout Additional summary Data Notification from goroutine")
-				n.Write(make([]byte, 20))
-			}
-		}()	
+		_, summaryEvents, unsubscribe := sim.Subscribe()
+		go eventNotifyLoop(n, sim, summaryEvents, unsubscribe, rowing.EncodeAdditionalEndOfWorkoutSummary)
 	})
 
-
 	/*
-		C2 rowing heart rate belt information characteristic
+		C2 rowing heart rate belt information characteristic: no belt is
+		paired in this emulator, so there's nothing to notify.
 	*/
 	heartRateBeltInfoChar := s.AddCharacteristic(attrHeartRateBeltInfoCharacteristicsUUID)
-	heartRateBeltInfoChar.HandleNotifyFunc(func(r gatt.Request, n gatt.Notifier) {
-		logrus.Info("Heart Rate Belt Info Char Notify Request - launching goroutine")
-		go func() {
-			for true {
-				logrus.Info("Heart Rate Belt Data Notification from goroutine")
-				n.Write(make([]byte, 6))
-				time.Sleep(100000 * time.Millisecond)
-
-			}
-		}()	
+	heartRateBeltInfoChar.HandleReadFunc(func(rsp gatt.ResponseWriter, req *gatt.ReadRequest) {
+		rsp.Write(make([]byte, 6))
 	})
 
 	/*
-		C2 force curve data characteristic
+		C2 force curve data characteristic: not modeled by this simulator.
 	*/
 	forceCurveDataChar := s.AddCharacteristic(attrForceCurveDataCharacteristicsUUID)
-	forceCurveDataChar.HandleNotifyFunc(func(r gatt.Request, n gatt.Notifier) {
-		logrus.Info("Force Curve Data Char Notify Request - launching goroutine")
-		go func() {
-			for true {
-				logrus.Info("Force Curve Data Notification from goroutine")
-				n.Write([]byte{0b000101001, 0x1, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0})
-				time.Sleep(1000 * time.Millisecond)
-			}
-		}()	
+	forceCurveDataChar.HandleReadFunc(func(rsp gatt.ResponseWriter, req *gatt.ReadRequest) {
+		rsp.Write(make([]byte, 2))
 	})
 
 	/*
-		C2 multiplexed information 	characteristic
+		C2 multiplexed information characteristic
 
 		0x0080 | Up to 20 bytes | READ Permission
+
+		Per spec, an ID is only multiplexed here while the matching
+		standalone characteristic notification is NOT enabled; this
+		emulator keeps it simple and always serves general status on read.
 	*/
 	multiplexedInfoChar := s.AddCharacteristic(attrMultiplexedInfoCharacteristicsUUID)
-
-	multiplexedInfoChar.HandleNotifyFunc(func(r gatt.Request, n gatt.Notifier) {
-		logrus.Info("Multiplex Info Char Notify Func")
-		//generate a rowing general status payload here
-		m:=mux.Multiplexer{}
-		n.Write(m.HandleC2RowingGeneralStatus([]byte{}))
+	multiplexedInfoChar.HandleReadFunc(func(rsp gatt.ResponseWriter, req *gatt.ReadRequest) {
+		rsp.Write(rowing.EncodeMultiplexed(rowing.IDGeneralStatus, sim.Snapshot()))
 	})
-
 
 	return s
 }

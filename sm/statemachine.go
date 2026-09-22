@@ -1,14 +1,18 @@
 package sm
 
-import "pm5-emulator/config"
+import (
+	"sync"
 
-//state
+	"pm5-emulator/config"
+)
+
+// state
 type state interface {
 	getStateName() string
 	update(command byte) error
 }
 
-//StateMachine offers 8 states of PM5
+// StateMachine offers 8 states of PM5
 type StateMachine struct {
 	READY    state
 	OFFLINE  state
@@ -19,10 +23,11 @@ type StateMachine struct {
 	HAVEID   state
 	PAUSED   state
 
+	mu           sync.RWMutex
 	currentState state
 }
 
-//NewStateMachine returns statemachine instance
+// NewStateMachine returns statemachine instance
 func NewStateMachine() *StateMachine {
 	pm := &StateMachine{}
 
@@ -37,18 +42,22 @@ func NewStateMachine() *StateMachine {
 	return pm
 }
 
-//GetStateName returns current state name
+// GetStateName returns current state name
 func (sm *StateMachine) GetStateName() string {
 	return sm.currentState.getStateName()
 }
 
-//GetState returns state interface
+// GetState returns state interface
 func (sm *StateMachine) GetState() state {
+	sm.mu.RLock()
+	defer sm.mu.RUnlock()
 	return sm.currentState
 }
 
-//SetState sets state of StateMachine
+// SetState sets state of StateMachine
 func (sm *StateMachine) SetState(s string) {
+	sm.mu.Lock()
+	defer sm.mu.Unlock()
 	switch s {
 	case config.PM5_STATE_IDLE:
 		sm.currentState = sm.IDLE
@@ -67,21 +76,24 @@ func (sm *StateMachine) SetState(s string) {
 	}
 }
 
-//Reset changes the state of emulator statemachine to READY state
+// Reset changes the state of emulator statemachine to READY state
 func (sm *StateMachine) Reset() {
 	sm.SetState(config.PM5_STATE_READY)
 }
 
-//Update changes the state of machine based on command
+// Update changes the state of machine based on command. It reads the current
+// state under lock, then applies the transition; the transition itself calls
+// back into SetState (which takes the lock independently), so Update never
+// holds sm.mu while calling into state.update to avoid deadlocking.
 func (sm *StateMachine) Update(command byte) error {
 	if command == config.CSAFE_RESET_CMD {
 		sm.Reset()
 		return nil
 	}
-	return sm.currentState.update(command)
+	return sm.GetState().update(command)
 }
 
-//IsIdle returns true if statemachine is in IDLE state otherwise false
+// IsIdle returns true if statemachine is in IDLE state otherwise false
 func (sm *StateMachine) IsIdle() bool {
 	if sm.GetState() == sm.IDLE {
 		return true
@@ -89,7 +101,7 @@ func (sm *StateMachine) IsIdle() bool {
 	return false
 }
 
-//HaveID returns true if statemachine is in HAVEID state otherwise false
+// HaveID returns true if statemachine is in HAVEID state otherwise false
 func (sm *StateMachine) HaveID() bool {
 	if sm.GetState() == sm.HAVEID {
 		return true
@@ -97,7 +109,7 @@ func (sm *StateMachine) HaveID() bool {
 	return false
 }
 
-//IsFinished returns true if statemachine is in FINISHED state otherwise false
+// IsFinished returns true if statemachine is in FINISHED state otherwise false
 func (sm *StateMachine) IsFinished() bool {
 	if sm.GetState() == sm.FINISHED {
 		return true
@@ -105,7 +117,7 @@ func (sm *StateMachine) IsFinished() bool {
 	return false
 }
 
-//IsReady returns true if statemachine is in READY state otherwise false
+// IsReady returns true if statemachine is in READY state otherwise false
 func (sm *StateMachine) IsReady() bool {
 	if sm.GetState() == sm.READY {
 		return true

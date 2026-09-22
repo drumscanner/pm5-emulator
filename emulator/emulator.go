@@ -2,24 +2,31 @@ package emulator
 
 import (
 	"fmt"
+	"github.com/bettercap/gatt"
+	"github.com/sirupsen/logrus"
 	"pm5-emulator/config"
 	"pm5-emulator/service"
+	"pm5-emulator/simulator"
 	"pm5-emulator/sm"
-	"github.com/sirupsen/logrus"
-	"github.com/bettercap/gatt"
 )
 
-//Emulator emulates PM5 indoor rower machine
+// Emulator emulates PM5 indoor rower machine
 type Emulator struct {
 	device       gatt.Device
 	stateMachine *sm.StateMachine
 }
 
-//RunEmulator registers handlers and starts advertising services
+// RunEmulator registers handlers and starts advertising services
 func (em *Emulator) RunEmulator() {
 
 	//register optional handlers
 	em.registerHandlers()
+
+	// Single, device-wide state machine and workout simulator shared by every
+	// service/characteristic, instead of each characteristic tracking its own.
+	em.stateMachine.Reset()
+	sim := simulator.NewSimulator(em.stateMachine)
+	go sim.Run()
 
 	// handler for monitoring config state.
 	onStateChanged := func(d gatt.Device, s gatt.State) {
@@ -34,10 +41,10 @@ func (em *Emulator) RunEmulator() {
 			s1 := service.NewDevInfoService()
 			d.AddService(s1)
 
-			s2 := service.NewControlService()
+			s2 := service.NewControlService(em.stateMachine, sim)
 			d.AddService(s2)
 
-			s3 := service.NewRowingService()
+			s3 := service.NewRowingService(sim)
 			d.AddService(s3)
 
 			// Advertise config name and service's UUIDs.
@@ -50,7 +57,7 @@ func (em *Emulator) RunEmulator() {
 	em.device.Init(onStateChanged)
 }
 
-//registerHandlers registers optional handlers for handling device connection and disconnection
+// registerHandlers registers optional handlers for handling device connection and disconnection
 func (em *Emulator) registerHandlers() {
 	// Register optional handlers.
 	em.device.Handle(

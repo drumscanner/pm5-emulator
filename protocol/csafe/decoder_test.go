@@ -51,3 +51,54 @@ func TestDecoder_Decode(t *testing.T) {
 		})
 	}
 }
+
+func TestDecoder_DecodeAll(t *testing.T) {
+	tests := []struct {
+		name    string
+		raw     []byte
+		want    []*Packet
+		wantErr bool
+	}{
+		{
+			"single short command",
+			[]byte{0xF1, byte(GOIDLE_CMD), calculateChecksum([]byte{byte(GOIDLE_CMD)}), 0xF2},
+			[]*Packet{{Data: nil, Cmds: []byte{byte(GOIDLE_CMD)}, JustCmd: true}},
+			false,
+		},
+		{
+			"single long command with data",
+			[]byte{0xF1, 0x01, 0x01, 0x02, calculateChecksum([]byte{0x01, 0x01, 0x02}), 0xF2},
+			[]*Packet{{Data: []byte{0x02}, Cmds: []byte{0x01}, JustCmd: false}},
+			false,
+		},
+		{
+			"chained short then long command",
+			[]byte{0xF1, byte(GOIDLE_CMD), 0x01, 0x01, 0x2A,
+				calculateChecksum([]byte{byte(GOIDLE_CMD), 0x01, 0x01, 0x2A}), 0xF2},
+			[]*Packet{
+				{Data: nil, Cmds: []byte{byte(GOIDLE_CMD)}, JustCmd: true},
+				{Data: []byte{0x2A}, Cmds: []byte{0x01}, JustCmd: false},
+			},
+			false,
+		},
+		{
+			"truncated long command",
+			[]byte{0xF1, 0x01, 0x05, 0x2A, calculateChecksum([]byte{0x01, 0x05, 0x2A}), 0xF2},
+			nil,
+			true,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			d := &Decoder{}
+			got, err := d.DecodeAll(tt.raw)
+			if (err != nil) != tt.wantErr {
+				t.Errorf("Decoder.DecodeAll() error = %v, wantErr %v", err, tt.wantErr)
+				return
+			}
+			if !reflect.DeepEqual(got, tt.want) {
+				t.Errorf("Decoder.DecodeAll() = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}

@@ -1,11 +1,15 @@
 package service
 
 import (
-	"fmt"
+	"time"
+
+	"pm5-emulator/config"
 	"pm5-emulator/protocol/csafe"
-	"pm5-emulator/service/decorator"
-	"github.com/sirupsen/logrus"
+	"pm5-emulator/simulator"
+	"pm5-emulator/sm"
+
 	"github.com/bettercap/gatt"
+	"github.com/sirupsen/logrus"
 )
 
 /*
@@ -18,53 +22,172 @@ var (
 	attrTransmitCharacteristicsUUID, _ = gatt.ParseUUID(getFullUUID("0022"))
 )
 
-//NewControlService advertises Control service offered by PM5
-func NewControlService() *gatt.Service {
+// responsePollInterval bounds how long the transmit notify loop blocks
+// between checking whether the client has unsubscribed (gatt.Notifier has no
+// blocking/cancelable wait, only a Done() poll).
+const responsePollInterval = 200 * time.Millisecond
+
+// NewControlService advertises the Control service offered by PM5. Incoming
+// CSAFE commands on the receive characteristic (0x0021) drive the shared
+// state machine and the workout simulator's configuration; a CSAFE response
+// frame is pushed back on the transmit characteristic (0x0022) for each
+// command processed, the way real PM5 clients (e.g. ErgData) expect.
+func NewControlService(machine *sm.StateMachine, sim *simulator.Simulator) *gatt.Service {
 	controlService := gatt.NewService(attrControlServiceUUID)
-	s := decorator.NewServiceSubscriber(controlService)
+
+	dec := csafe.Decoder{}
+	enc := csafe.Encoder{}
+	responses := make(chan []byte, 8)
 
 	/*
-		C2 PM receive characteristic
+		C2 PM receive characteristic (write-only per spec)
 	*/
-	csafeDec := csafe.Decoder{}
-
-	receiveChar := s.AddCharacteristic(attrReceiveCharacteristicsUUID)
+	receiveChar := controlService.AddCharacteristic(attrReceiveCharacteristicsUUID)
 	receiveChar.HandleWriteFunc(func(r gatt.Request, data []byte) (status byte) {
-		pck, err := csafeDec.Decode(data)
-
-		str := fmt.Sprintf("[[Control]] Decoded Command: 0x%x Data: [ ", pck.Cmds[0])
-		for i := 0; i < len(pck.Data); i++ {
-			str = fmt.Sprintf("%s0x%x ", str, pck.Data[i])
+		packets, err := dec.DecodeAll(data)
+		if err != nil {
+			logrus.Warnf("[[Control]] failed to decode CSAFE frame %v: %v", data, err)
+			return gatt.StatusUnexpectedError
 		}
-		str = fmt.Sprintf("%s] Error: %v", str, err)
 
-		logrus.Info(str)
-		return 1
-		//return gatt.StatusSuccess
-	})
+		for _, pkt := range packets {
+			cmd := pkt.Cmds[0]
+			logrus.Infof("[[Control]] decoded command 0x%x data=%v", cmd, pkt.Data)
 
-	receiveChar.HandleNotifyFunc(func(r gatt.Request, n gatt.Notifier) {
-		logrus.Info(fmt.Sprintf("[[Control]] notify called by device ID: %v", r.Central.ID()))
-		l := n.Cap()
-		data := make([]byte, l)
-		n.Write(data)
+			handleCommand(machine, sim, cmd, pkt.Data)
+
+			resp := enc.EncodeResponse(csafe.ResponsePacket{
+				Status:     statusByte(machine),
+				Identifier: cmd,
+				JustCmd:    true,
+			})
+			select {
+			case responses <- resp:
+			default:
+				logrus.Warn("[[Control]] response queue full, dropping a CSAFE response")
+			}
+		}
+
+		return gatt.StatusSuccess
 	})
 
 	/*
-		C2 PM transmit characteristic
+		C2 PM transmit characteristic: pushes one CSAFE response per
+		processed command, produced by the receive handler above.
 	*/
-	transmitChar := s.AddCharacteristic(attrTransmitCharacteristicsUUID)
+	transmitChar := controlService.AddCharacteristic(attrTransmitCharacteristicsUUID)
 	transmitChar.HandleNotifyFunc(func(r gatt.Request, n gatt.Notifier) {
-		logrus.Info("[[Transmit]] Notify Signal")
-		n.Write([]byte{0x76, 0x77, 0x7E, 0x7F})
+		logrus.Info("[[Transmit]] client subscribed")
+		for {
+			if n.Done() {
+				return
+			}
+			select {
+			case resp := <-responses:
+				if _, err := writeNotification(n, resp); err != nil {
+					logrus.Warnf("[[Transmit]] write failed, stopping notify loop: %v", err)
+					return
+				}
+			case <-time.After(responsePollInterval):
+			}
+		}
 	})
-
-	transmitChar.HandleReadFunc(func(resp gatt.ResponseWriter, req *gatt.ReadRequest) {
-		logrus.Info("[[Transmit]] Transmitting Data")
-		data := make([]byte, 20)
-		resp.Write(data)
-	})
-
 
 	return controlService
+}
+
+// handleCommand applies the effect of a single decoded CSAFE command:
+// control commands (GOIDLE/GOHAVEID/GOINUSE/...) drive the shared state
+// machine, workout-configuration commands (SETTWORK/SETHORIZONTAL/...)
+// configure the simulator, and everything else is accepted as a no-op,
+// matching how a real PM5 tolerates commands it doesn't specifically act on.
+func handleCommand(machine *sm.StateMachine, sim *simulator.Simulator, cmd byte, data []byte) {
+	switch cmd {
+	case byte(csafe.RESET_CMD):
+		machine.Reset()
+		sim.Reset()
+	case byte(csafe.GOIDLE_CMD), byte(csafe.GOHAVEID_CMD), byte(csafe.GOINUSE_CMD),
+		byte(csafe.GOFINISHED_CMD), byte(csafe.GOREADY_CMD):
+		if err := machine.Update(cmd); err != nil {
+			logrus.Debugf("[[Control]] cmd 0x%x rejected in state %s: %v", cmd, machine.GetStateName(), err)
+		}
+	case byte(csafe.SETTWORK_CMD):
+		applySetTwork(sim, data)
+	case byte(csafe.SETHORIZONTAL_CMD):
+		applySetHorizontal(sim, data)
+	case byte(csafe.SETPROGRAM_CMD):
+		// Program-based workouts aren't modeled in detail; fall back to an
+		// unlimited "Just Row" so the simulator still produces sane data.
+		sim.ConfigureWorkout(simulator.WorkoutConfig{WorkoutType: config.WORKOUTTYPE_JUSTROW_NOSPLITS})
+	default:
+		// GETSTATUS/GETVERSION/audio/text/... commands: acknowledged (a
+		// response is still sent by the caller) but otherwise a no-op.
+	}
+}
+
+// applySetTwork configures a fixed-time workout from a SETTWORK_CMD payload.
+// Per the Hours/Minutes/Seconds triplet convention used elsewhere in this
+// CSAFE command set (see HMS_FORMAT_CNT in csafe-defs.go), the payload is
+// [hours, minutes, seconds].
+func applySetTwork(sim *simulator.Simulator, data []byte) {
+	if len(data) < 3 {
+		return
+	}
+	duration := time.Duration(data[0])*time.Hour +
+		time.Duration(data[1])*time.Minute +
+		time.Duration(data[2])*time.Second
+
+	sim.ConfigureWorkout(simulator.WorkoutConfig{
+		WorkoutType:    config.WORKOUTTYPE_FIXEDTIME_NOSPLITS,
+		DurationType:   config.CSAFE_TIME_DURATION,
+		TargetDuration: duration,
+	})
+}
+
+// applySetHorizontal configures a fixed-distance workout from a
+// SETHORIZONTAL_CMD payload. This emulator's bundled spec docs only cover
+// the PM5-specific BLE characteristics, not the generic CSAFE Protocol
+// Technical Spec that defines this command's wire format, so this is a
+// reasonable best-effort decode (big-endian meters, matching this codebase's
+// existing csafe.Encoder.getBytesArray convention) rather than a verified
+// one.
+func applySetHorizontal(sim *simulator.Simulator, data []byte) {
+	if len(data) < 2 {
+		return
+	}
+	distance := float64(uint16(data[0])<<8 | uint16(data[1]))
+
+	sim.ConfigureWorkout(simulator.WorkoutConfig{
+		WorkoutType:    config.WORKOUTTYPE_FIXEDDIST_NOSPLITS,
+		DurationType:   config.CSAFE_DISTANCE_DURATION,
+		TargetDistance: distance,
+	})
+}
+
+// statusByte builds a CSAFE response status byte: frame-status nibble
+// (PREVOK_FLG, since a decoded-but-unsupported command is still accepted)
+// combined with the current PM5 slave state nibble.
+func statusByte(machine *sm.StateMachine) byte {
+	return csafe.PREVOK_FLG | slaveStateFlag(machine)
+}
+
+func slaveStateFlag(machine *sm.StateMachine) byte {
+	switch machine.GetStateName() {
+	case config.PM5_STATE_READY:
+		return csafe.SLAVESTATE_RDY_FLG
+	case config.PM5_STATE_IDLE:
+		return csafe.SLAVESTATE_IDLE_FLG
+	case config.PM5_STATE_HAVEID:
+		return csafe.SLAVESTATE_HAVEID_FLG
+	case config.PM5_STATE_INUSE:
+		return csafe.SLAVESTATE_INUSE_FLG
+	case config.PM5_STATE_PAUSED:
+		return csafe.SLAVESTATE_PAUSE_FLG
+	case config.PM5_STATE_FINISHED:
+		return csafe.SLAVESTATE_FINISH_FLG
+	case config.PM5_STATE_MANUAL:
+		return csafe.SLAVESTATE_MANUAL_FLG
+	default:
+		return csafe.SLAVESTATE_ERR_FLG
+	}
 }

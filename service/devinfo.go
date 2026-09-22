@@ -78,7 +78,10 @@ func NewDevInfoService() *gatt.Service {
 	ergMachineTypeChar := s.AddCharacteristic(attrErgMachineTypeUUID)
 	ergMachineTypeChar.HandleReadFunc(func(rsp gatt.ResponseWriter, req *gatt.ReadRequest) {
 		logrus.Info("Erg Machine Type Read")
-		rsp.Write([]byte(config.ERG_MACHINE_TYPE)) //upto 1 byte
+		// Single enumerated byte per spec (Appendix A: Erg Machine Type),
+		// not a human-readable string -- this previously sent the 8-byte
+		// ASCII string "Static D" where exactly 1 byte was expected.
+		rsp.Write([]byte{config.ERGMACHINE_TYPE_STATIC_D})
 	})
 
 	return s
