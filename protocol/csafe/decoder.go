@@ -87,6 +87,35 @@ func (d *Decoder) DecodeAll(raw []byte) ([]*Packet, error) {
 	return packets, nil
 }
 
+// ExtractFrame locates a single CSAFE frame (FRAME_START_BYTE ...
+// FRAME_END_BYTE) within a raw buffer that may carry extra bytes before or
+// after it -- some BLE clients pad a characteristic write out to a fixed
+// buffer size (e.g. the negotiated ATT MTU) rather than writing exactly the
+// frame's own length, or prefix it with a transport-level sequence byte.
+// Since 0xF1/0xF2 can only appear as unescaped frame delimiters (any 0xF0-
+// 0xF3 byte inside the frame is byte-stuffed), the first START..END span
+// found is unambiguously the frame. Returns ok=false if no complete frame
+// is present.
+func ExtractFrame(raw []byte) (frame []byte, ok bool) {
+	start := -1
+	for i, b := range raw {
+		if b == FRAME_START_BYTE {
+			start = i
+			break
+		}
+	}
+	if start == -1 {
+		return nil, false
+	}
+
+	for i := start + 1; i < len(raw); i++ {
+		if raw[i] == FRAME_END_BYTE {
+			return raw[start : i+1], true
+		}
+	}
+	return nil, false
+}
+
 // decodeFrame strips framing, reverses byte-stuffing and validates the
 // checksum, returning the command+data bytes (without the checksum byte).
 func (d *Decoder) decodeFrame(raw []byte) ([]byte, error) {

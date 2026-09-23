@@ -1,6 +1,7 @@
 package service
 
 import (
+	"sync/atomic"
 	"time"
 
 	"pm5-emulator/config"
@@ -38,34 +39,49 @@ func NewControlService(machine *sm.StateMachine, sim *simulator.Simulator) *gatt
 	dec := csafe.Decoder{}
 	enc := csafe.Encoder{}
 	responses := make(chan []byte, 8)
+	var frameToggle uint32 // low bit alternates per response, per FRAMECNT_FLG
 
 	/*
 		C2 PM receive characteristic (write-only per spec)
 	*/
 	receiveChar := controlService.AddCharacteristic(attrReceiveCharacteristicsUUID)
 	receiveChar.HandleWriteFunc(func(r gatt.Request, data []byte) (status byte) {
-		packets, err := dec.DecodeAll(data)
+		frame, ok := csafe.ExtractFrame(data)
+		if !ok {
+			logrus.Warnf("[[Control]] no CSAFE frame found in write %v", data)
+			return gatt.StatusUnexpectedError
+		}
+
+		packets, err := dec.DecodeAll(frame)
 		if err != nil {
-			logrus.Warnf("[[Control]] failed to decode CSAFE frame %v: %v", data, err)
+			logrus.Warnf("[[Control]] failed to decode CSAFE frame %v: %v", frame, err)
 			return gatt.StatusUnexpectedError
 		}
 
 		for _, pkt := range packets {
 			cmd := pkt.Cmds[0]
 			logrus.Infof("[[Control]] decoded command 0x%x data=%v", cmd, pkt.Data)
-
 			handleCommand(machine, sim, cmd, pkt.Data)
+		}
 
-			resp := enc.EncodeResponse(csafe.ResponsePacket{
-				Status:     statusByte(machine),
-				Identifier: cmd,
-				JustCmd:    true,
-			})
-			select {
-			case responses <- resp:
-			default:
-				logrus.Warn("[[Control]] response queue full, dropping a CSAFE response")
-			}
+		// A response frame carries one status byte for the whole incoming
+		// write (which may itself have chained several commands), not one
+		// per command -- per the spec's own worked examples (Figure 8/9),
+		// a response to e.g. GOINUSE (`F1 85 85 F2`) is just that single
+		// status byte reframed (`F1 <status> <status> F2`), not a longer
+		// frame echoing the command back.
+		var toggle byte
+		if atomic.AddUint32(&frameToggle, 1)&1 == 1 {
+			toggle = csafe.FRAMECNT_FLG
+		}
+		resp := enc.Encode(csafe.Packet{
+			Cmds:    []byte{toggle | statusByte(machine)},
+			JustCmd: true,
+		})
+		select {
+		case responses <- resp:
+		default:
+			logrus.Warn("[[Control]] response queue full, dropping a CSAFE response")
 		}
 
 		return gatt.StatusSuccess

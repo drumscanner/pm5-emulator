@@ -52,6 +52,37 @@ func TestDecoder_Decode(t *testing.T) {
 	}
 }
 
+func TestExtractFrame(t *testing.T) {
+	tests := []struct {
+		name   string
+		raw    []byte
+		want   []byte
+		wantOk bool
+	}{
+		{"exact frame, no padding", []byte{0xF1, 0x82, 0x82, 0xF2}, []byte{0xF1, 0x82, 0x82, 0xF2}, true},
+		{
+			"leading byte and trailing zero padding (real ATT write)",
+			[]byte{0x01, 0xF1, 0x7E, 0x01, 0x85, 0xFA, 0xF2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0},
+			[]byte{0xF1, 0x7E, 0x01, 0x85, 0xFA, 0xF2},
+			true,
+		},
+		{"no start byte", []byte{0x00, 0x01, 0x02}, nil, false},
+		{"start byte but no end byte", []byte{0xF1, 0x82, 0x82}, nil, false},
+		{"empty", []byte{}, nil, false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, ok := ExtractFrame(tt.raw)
+			if ok != tt.wantOk {
+				t.Fatalf("ExtractFrame() ok = %v, want %v", ok, tt.wantOk)
+			}
+			if !reflect.DeepEqual(got, tt.want) {
+				t.Errorf("ExtractFrame() = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
 func TestDecoder_DecodeAll(t *testing.T) {
 	tests := []struct {
 		name    string
