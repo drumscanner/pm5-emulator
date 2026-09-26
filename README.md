@@ -45,6 +45,18 @@ Advertise your custom PM5 service (as emulator):
 sudo ./pm5-emulator
 ```
 
+## Command-line Options
+
+| Flag      | Default | Description |
+|:----------|:--------|:-------------|
+| `-csv`    | (none)  | Path to a recorded PM5 session CSV to replay instead of the built-in physics simulator. |
+| `-start`  | `auto`  | How a workout begins: `auto` starts the workout by itself ~1s after a client connects (for passive/read-only clients that never send control commands); `manual` waits for the client to send the CSAFE `GOIDLE`/`GOHAVEID`/`GOINUSE` sequence itself, as it would need to against a real PM5. |
+
+```bash
+# Replay a recorded session, waiting for the client to start the workout itself
+sudo ./pm5-emulator -csv path/to/session.csv -start=manual
+```
+
 ## Common Errors
 
 ***rf-kill errror***
