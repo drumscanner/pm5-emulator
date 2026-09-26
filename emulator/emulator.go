@@ -23,14 +23,25 @@ type Emulator struct {
 	stateMachine *sm.StateMachine
 }
 
-// RunEmulator registers handlers and starts advertising services
-func (em *Emulator) RunEmulator() {
+// RunEmulator registers handlers and starts advertising services. When
+// csvPath is non-empty, a recorded PM5 session is replayed from that file
+// instead of the built-in physics simulator driving the workout data.
+func (em *Emulator) RunEmulator(csvPath string) {
 
 	// Single, device-wide state machine and workout simulator shared by every
 	// service/characteristic, instead of each characteristic tracking its own.
 	em.stateMachine.Reset()
 	sim := simulator.NewSimulator(em.stateMachine)
-	go sim.Run()
+	if csvPath != "" {
+		timeline, err := simulator.LoadCSVTimeline(csvPath)
+		if err != nil {
+			logrus.Fatalf("failed to load CSV session %q: %v", csvPath, err)
+		}
+		logrus.Infof("replaying recorded session from %q", csvPath)
+		go timeline.Play(sim)
+	} else {
+		go sim.Run()
+	}
 
 	//register optional handlers
 	em.registerHandlers(sim)

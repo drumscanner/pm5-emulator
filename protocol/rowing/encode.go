@@ -22,6 +22,7 @@ const (
 	IDAdditionalSplitIntervalData   = 0x38
 	IDEndOfWorkoutSummary           = 0x39
 	IDAdditionalEndOfWorkoutSummary = 0x3A
+	IDAdditionalStatus3             = 0x3E
 )
 
 // --- small helpers -----------------------------------------------------
@@ -204,6 +205,70 @@ func EncodeAdditionalEndOfWorkoutSummary(s simulator.LiveState) []byte {
 	b = appendU16(b, clampU16(seconds(s.RestTime)))
 	b = appendU16(b, clampU16(s.AvgCalories))
 	return b
+}
+
+// --- 0x003E C2 rowing additional status 3 (13 bytes, newer PM5 firmware
+// only; not part of the 0x0080 multiplexed set) --------------------------
+
+func EncodeAdditionalStatus3(s simulator.LiveState) []byte {
+	b := make([]byte, 0, 13)
+	b = append(b, s.OperationalState, s.VerificationState)
+	b = appendU16(b, s.ScreenNumber)
+	b = appendU16(b, s.LastError)
+	b = append(b, 0, 0, 0) // reserved/unused
+	b = append(b, s.GameID)
+	b = appendU16(b, s.GameScore)
+	b = append(b, s.BatteryLevel)
+	return b
+}
+
+// --- 0x003D Force Curve Data (segmented across several notifications) ---
+
+// EncodeForceCurvePackets splits one stroke's force-curve points into the
+// segmented packet format real PM5 clients expect: each packet is
+// [header, seq, point0_lo, point0_hi, ...], where header's high nibble is
+// the total packet count for this curve and low nibble is this packet's
+// point count, and seq is 0-based (a curve always restarts at seq 0).
+// maxPointsPerPacket is clamped to [1,15] (it must fit a nibble); if the
+// curve is too long to fit in 15 packets at that size, trailing points
+// beyond capacity are dropped -- real curves are ~50-90 points, so this
+// never triggers in practice.
+func EncodeForceCurvePackets(points []uint16, maxPointsPerPacket int) [][]byte {
+	if maxPointsPerPacket < 1 {
+		maxPointsPerPacket = 1
+	}
+	if maxPointsPerPacket > 15 {
+		maxPointsPerPacket = 15
+	}
+
+	totalPackets := (len(points) + maxPointsPerPacket - 1) / maxPointsPerPacket
+	if totalPackets > 15 {
+		totalPackets = 15
+		if max := totalPackets * maxPointsPerPacket; len(points) > max {
+			points = points[:max]
+		}
+	}
+	if totalPackets == 0 {
+		return nil
+	}
+
+	packets := make([][]byte, 0, totalPackets)
+	for seq := 0; seq < totalPackets; seq++ {
+		start := seq * maxPointsPerPacket
+		end := start + maxPointsPerPacket
+		if end > len(points) {
+			end = len(points)
+		}
+		chunk := points[start:end]
+
+		packet := make([]byte, 0, 2+2*len(chunk))
+		packet = append(packet, byte(totalPackets<<4)|byte(len(chunk)), byte(seq))
+		for _, p := range chunk {
+			packet = appendU16(packet, p)
+		}
+		packets = append(packets, packet)
+	}
+	return packets
 }
 
 // encoders maps a multiplexed-information ID byte to its encode function.

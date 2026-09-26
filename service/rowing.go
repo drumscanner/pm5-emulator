@@ -30,6 +30,7 @@ var (
 	attrAdditionalEndOfWorkoutSummaryDataCharacteristicsUUID, _ = gatt.ParseUUID(getFullUUID("003A"))
 	attrHeartRateBeltInfoCharacteristicsUUID, _                 = gatt.ParseUUID(getFullUUID("003B"))
 	attrForceCurveDataCharacteristicsUUID, _                    = gatt.ParseUUID(getFullUUID("003D"))
+	attrAdditionalStatus3CharacteristicsUUID, _                 = gatt.ParseUUID(getFullUUID("003E"))
 	attrMultiplexedInfoCharacteristicsUUID, _                   = gatt.ParseUUID(getFullUUID("0080"))
 )
 
@@ -81,6 +82,34 @@ func eventNotifyLoop(n gatt.Notifier, sim *simulator.Simulator, events <-chan st
 	}
 }
 
+// forceCurveNotifyLoop writes one burst of segmented packets (via
+// rowing.EncodeForceCurvePackets) each time a completed stroke's points
+// arrive on points, until the client unsubscribes.
+func forceCurveNotifyLoop(n gatt.Notifier, points <-chan []uint16, unsubscribe func()) {
+	defer unsubscribe()
+	for {
+		if n.Done() {
+			return
+		}
+		select {
+		case pts := <-points:
+			maxPointsPerPacket := (n.Cap() - 2) / 2
+			if maxPointsPerPacket < 1 {
+				maxPointsPerPacket = 1
+			}
+			if maxPointsPerPacket > 15 {
+				maxPointsPerPacket = 15
+			}
+			for _, packet := range rowing.EncodeForceCurvePackets(pts, maxPointsPerPacket) {
+				if _, err := writeNotification(n, packet); err != nil {
+					return
+				}
+			}
+		case <-time.After(200 * time.Millisecond):
+		}
+	}
+}
+
 // NewRowingService advertises rowing service defined by PM5 device, backed by
 // sim: every characteristic reflects the same shared, physics-based workout
 // simulation rather than independent dummy data.
@@ -115,6 +144,17 @@ func NewRowingService(sim *simulator.Simulator) *gatt.Service {
 	additionalStatus2Char.HandleNotifyFunc(func(r gatt.Request, n gatt.Notifier) {
 		logrus.Info("Additional Status 2 Char Notify Request - launching goroutine")
 		go notifyLoop(n, sim, &sampleRateCode, rowing.EncodeAdditionalStatus2)
+	})
+
+	/*
+		C2 rowing additional status 3 characteristic (0x003E, newer PM5
+		firmware only): operational/verification state, current screen,
+		last error, game id/score, battery level.
+	*/
+	additionalStatus3Char := s.AddCharacteristic(attrAdditionalStatus3CharacteristicsUUID)
+	additionalStatus3Char.HandleNotifyFunc(func(r gatt.Request, n gatt.Notifier) {
+		logrus.Info("Additional Status 3 Char Notify Request - launching goroutine")
+		go notifyLoop(n, sim, &sampleRateCode, rowing.EncodeAdditionalStatus3)
 	})
 
 	/*
@@ -213,11 +253,18 @@ func NewRowingService(sim *simulator.Simulator) *gatt.Service {
 	})
 
 	/*
-		C2 force curve data characteristic: not modeled by this simulator.
+		C2 force curve data characteristic: fires a burst of segmented
+		notifications once per completed stroke (only produced by CSV
+		playback today; the physics simulator doesn't model a force curve).
 	*/
 	forceCurveDataChar := s.AddCharacteristic(attrForceCurveDataCharacteristicsUUID)
 	forceCurveDataChar.HandleReadFunc(func(rsp gatt.ResponseWriter, req *gatt.ReadRequest) {
 		rsp.Write(make([]byte, 2))
+	})
+	forceCurveDataChar.HandleNotifyFunc(func(r gatt.Request, n gatt.Notifier) {
+		logrus.Info("Force Curve Data Char Notify Request - launching goroutine")
+		points, unsubscribe := sim.SubscribeForceCurve()
+		go forceCurveNotifyLoop(n, points, unsubscribe)
 	})
 
 	/*

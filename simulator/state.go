@@ -85,4 +85,13 @@ type LiveState struct {
 	SplitIntervalCount byte
 	TotalRestDistance  float64
 	AvgCalories        float64 // cal/hr
+
+	// Additional status 3 (0x003E, newer PM5 firmware only)
+	OperationalState  byte
+	VerificationState byte
+	ScreenNumber      uint16
+	LastError         uint16
+	GameID            byte
+	GameScore         uint16
+	BatteryLevel      byte
 }

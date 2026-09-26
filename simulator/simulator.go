@@ -51,8 +51,9 @@ type Simulator struct {
 
 	rng *rand.Rand
 
-	subsMu sync.RWMutex
-	subs   []*eventSubscription
+	subsMu         sync.RWMutex
+	subs           []*eventSubscription
+	forceCurveSubs []chan []uint16
 }
 
 // eventSubscription delivers split-boundary and workout-finished events to
@@ -127,6 +128,61 @@ func (s *Simulator) publishSummary() {
 	}
 }
 
+// SubscribeForceCurve registers a new force-curve event listener, returning
+// its channel (one completed stroke's raw points per event) plus a function
+// to unregister it. Separate from Subscribe/eventSubscription since only the
+// Force Curve characteristic needs this one.
+func (s *Simulator) SubscribeForceCurve() (points <-chan []uint16, unsubscribe func()) {
+	ch := make(chan []uint16, 1)
+
+	s.subsMu.Lock()
+	s.forceCurveSubs = append(s.forceCurveSubs, ch)
+	s.subsMu.Unlock()
+
+	unsubscribe = func() {
+		s.subsMu.Lock()
+		defer s.subsMu.Unlock()
+		for i, x := range s.forceCurveSubs {
+			if x == ch {
+				s.forceCurveSubs = append(s.forceCurveSubs[:i], s.forceCurveSubs[i+1:]...)
+				break
+			}
+		}
+	}
+
+	return ch, unsubscribe
+}
+
+func (s *Simulator) publishForceCurve(points []uint16) {
+	s.subsMu.RLock()
+	defer s.subsMu.RUnlock()
+	for _, ch := range s.forceCurveSubs {
+		select {
+		case ch <- points:
+		default:
+		}
+	}
+}
+
+// applyFrame overwrites the live state wholesale (used by the CSV player,
+// which reconstructs a full snapshot per row rather than incrementally
+// deriving one field from another like tick() does), firing the same
+// split/summary events tick() would have fired had it produced this
+// transition itself.
+func (s *Simulator) applyFrame(next LiveState) {
+	s.mu.Lock()
+	prev := s.state
+	s.state = next
+	s.mu.Unlock()
+
+	if next.LastSplitDistance != prev.LastSplitDistance || next.SplitIntervalNumber != prev.SplitIntervalNumber {
+		s.publishSplit()
+	}
+	if next.WorkoutState == config.WORKOUTSTATE_WORKOUTEND && prev.WorkoutState != config.WORKOUTSTATE_WORKOUTEND {
+		s.publishSummary()
+	}
+}
+
 // ConfigureWorkout applies a new workout configuration (from a CSAFE
 // SETTWORK/SETHORIZONTAL/SETPROGRAM/... command) and resets live counters.
 func (s *Simulator) ConfigureWorkout(cfg WorkoutConfig) {
@@ -152,7 +208,19 @@ func (s *Simulator) Reset() {
 }
 
 func (s *Simulator) resetLocked() {
-	s.state = LiveState{
+	s.state = newLiveState()
+	s.lastSplitDistance = 0
+	s.lastSplitElapsed = 0
+	s.strokePhase = 0
+}
+
+// newLiveState returns the correct "nothing happening yet" defaults: heart
+// rate and its derivatives read as invalid (255, no belt paired), and
+// interval type reads as NONE rather than 0 (which is a real interval type,
+// INTERVALTYPE_TIME) -- sending 0 would make every "Just Row" workout look
+// like an active time interval to clients.
+func newLiveState() LiveState {
+	return LiveState{
 		HeartRate:          255,
 		EndingHeartrate:    255,
 		AvgHeartrate:       255,
@@ -161,16 +229,9 @@ func (s *Simulator) resetLocked() {
 		RecoveryHeartRate:  255,
 		SplitWorkHeartrate: 255,
 		SplitRestHeartrate: 255,
-		// This simulator doesn't model intervals; NONE is the correct "no
-		// interval configured" sentinel, not zero (which is a real interval
-		// type, INTERVALTYPE_TIME) -- sending 0 here previously made every
-		// "Just Row" workout look like an active time interval to clients.
-		IntervalType:      config.INTERVALTYPE_NONE,
-		SplitIntervalType: config.INTERVALTYPE_NONE,
+		IntervalType:       config.INTERVALTYPE_NONE,
+		SplitIntervalType:  config.INTERVALTYPE_NONE,
 	}
-	s.lastSplitDistance = 0
-	s.lastSplitElapsed = 0
-	s.strokePhase = 0
 }
 
 // Snapshot returns a thread-safe copy of the current live state.
