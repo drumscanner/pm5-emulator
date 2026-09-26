@@ -25,8 +25,12 @@ type Emulator struct {
 
 // RunEmulator registers handlers and starts advertising services. When
 // csvPath is non-empty, a recorded PM5 session is replayed from that file
-// instead of the built-in physics simulator driving the workout data.
-func (em *Emulator) RunEmulator(csvPath string) {
+// instead of the built-in physics simulator driving the workout data. When
+// autoStart is true, the emulator drives itself into an active workout
+// shortly after a client connects (see autoStartWorkout); when false, it
+// waits for the client to send the CSAFE GOIDLE/GOHAVEID/GOINUSE sequence
+// itself, as it would need to against a real PM5.
+func (em *Emulator) RunEmulator(csvPath string, autoStart bool) {
 
 	// Single, device-wide state machine and workout simulator shared by every
 	// service/characteristic, instead of each characteristic tracking its own.
@@ -44,7 +48,7 @@ func (em *Emulator) RunEmulator(csvPath string) {
 	}
 
 	//register optional handlers
-	em.registerHandlers(sim)
+	em.registerHandlers(sim, autoStart)
 
 	// handler for monitoring config state.
 	onStateChanged := func(d gatt.Device, s gatt.State) {
@@ -76,7 +80,7 @@ func (em *Emulator) RunEmulator(csvPath string) {
 }
 
 // registerHandlers registers optional handlers for handling device connection and disconnection
-func (em *Emulator) registerHandlers(sim *simulator.Simulator) {
+func (em *Emulator) registerHandlers(sim *simulator.Simulator, autoStart bool) {
 	// Register optional handlers.
 	em.device.Handle(
 		gatt.PeripheralConnected(func(p gatt.Peripheral, err error) {
@@ -88,7 +92,9 @@ func (em *Emulator) registerHandlers(sim *simulator.Simulator) {
 		gatt.CentralConnected(func(c gatt.Central) {
 			logrus.Info("|Device Connected| ID=> ", c.ID())
 			logrus.Info("MTU: ", c.MTU())
-			go em.autoStartWorkout(sim)
+			if autoStart {
+				go em.autoStartWorkout(sim)
+			}
 		}),
 		gatt.CentralDisconnected(func(c gatt.Central) {
 			logrus.Info("|Device Disconnected| ID=> ", c.ID())
