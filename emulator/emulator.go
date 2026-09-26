@@ -108,6 +108,7 @@ func (em *Emulator) autoStartWorkout(sim *simulator.Simulator) {
 
 	em.stateMachine.Reset()
 	sim.Reset()
+	sim.RequestRestart()
 	for _, cmd := range []byte{config.CSAFE_GOIDLE_CMD, config.CSAFE_GOHAVEID_CMD, config.CSAFE_GOINUSE_CMD} {
 		if err := em.stateMachine.Update(cmd); err != nil {
 			logrus.Warnf("auto-start: cmd 0x%x rejected: %v", cmd, err)

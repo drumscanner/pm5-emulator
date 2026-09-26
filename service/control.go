@@ -122,10 +122,16 @@ func handleCommand(machine *sm.StateMachine, sim *simulator.Simulator, cmd byte,
 	case byte(csafe.RESET_CMD):
 		machine.Reset()
 		sim.Reset()
+		sim.RequestRestart()
 	case byte(csafe.GOIDLE_CMD), byte(csafe.GOHAVEID_CMD), byte(csafe.GOINUSE_CMD),
 		byte(csafe.GOFINISHED_CMD), byte(csafe.GOREADY_CMD):
 		if err := machine.Update(cmd); err != nil {
 			logrus.Debugf("[[Control]] cmd 0x%x rejected in state %s: %v", cmd, machine.GetStateName(), err)
+		} else if cmd == byte(csafe.GOINUSE_CMD) {
+			// Always (re)start CSV playback from the first stroke on a
+			// fresh transition into INUSE, regardless of wherever a prior
+			// pass happened to be.
+			sim.RequestRestart()
 		}
 	case byte(csafe.SETTWORK_CMD):
 		applySetTwork(sim, data)

@@ -54,6 +54,9 @@ type Simulator struct {
 	subsMu         sync.RWMutex
 	subs           []*eventSubscription
 	forceCurveSubs []chan []uint16
+
+	restartMu sync.Mutex
+	restartCh chan struct{}
 }
 
 // eventSubscription delivers split-boundary and workout-finished events to
@@ -76,9 +79,32 @@ func NewSimulator(machine *sm.StateMachine) *Simulator {
 		strokeRateSPM:  24,
 		dragFactor:     120,
 		rng:            rand.New(rand.NewSource(time.Now().UnixNano())),
+		restartCh:      make(chan struct{}),
 	}
 	s.resetLocked()
 	return s
+}
+
+// RequestRestart signals any in-progress CSV playback pass (see
+// CSVTimeline.playOnce) to abort immediately and restart from the first
+// stroke, e.g. when a new client connects mid-playback. Polling the state
+// machine alone isn't reliable for this: a Reset()-then-straight-back-to-
+// INUSE transition (as autoStartWorkout does) can happen entirely inside
+// one of playOnce's real-time sleeps between frames and never be observed.
+func (s *Simulator) RequestRestart() {
+	s.restartMu.Lock()
+	defer s.restartMu.Unlock()
+	close(s.restartCh)
+	s.restartCh = make(chan struct{})
+}
+
+// restartSignal returns the channel that RequestRestart closes to broadcast
+// a restart. Callers should re-fetch it after it fires, since it's replaced
+// on every call to RequestRestart.
+func (s *Simulator) restartSignal() <-chan struct{} {
+	s.restartMu.Lock()
+	defer s.restartMu.Unlock()
+	return s.restartCh
 }
 
 // Subscribe registers a new event listener and returns its split-boundary

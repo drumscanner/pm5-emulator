@@ -217,3 +217,67 @@ func TestCSVTimeline_Play_RespectsStateMachineAndLoops(t *testing.T) {
 	default:
 	}
 }
+
+func TestCSVTimeline_RequestRestart_InterruptsMidSleep(t *testing.T) {
+	// 20 strokes, 300ms apart: a full natural loop takes ~6s, long enough
+	// that "back at the first stroke" within a couple hundred ms can only
+	// mean RequestRestart actually interrupted playback -- not that it
+	// just happened to loop around naturally in that window.
+	const numStrokes = 20
+	const strokeGap = 300 * time.Millisecond
+
+	body := ""
+	at := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+	for i := 1; i <= numStrokes; i++ {
+		ts := at.Format(csvTimeLayout)
+		body += ts + ",general.rowing_state,1\n"
+		body += ts + ",general.stroke_state,2\n"
+		body += ts + ",general.distance," + strconv.Itoa(i*10) + "\n"
+		body += ts + ",stroke.count," + strconv.Itoa(i) + "\n"
+		at = at.Add(strokeGap)
+	}
+	path := writeCSV(t, body)
+
+	timeline, err := LoadCSVTimeline(path)
+	if err != nil {
+		t.Fatalf("LoadCSVTimeline: %v", err)
+	}
+
+	machine := sm.NewStateMachine()
+	machine.Reset()
+	_ = machine.Update(config.CSAFE_GOIDLE_CMD)
+	_ = machine.Update(config.CSAFE_GOHAVEID_CMD)
+	_ = machine.Update(config.CSAFE_GOINUSE_CMD)
+
+	sim := NewSimulator(machine)
+	go timeline.Play(sim)
+
+	// Wait until we're several strokes in (distance=50) and, given the
+	// 300ms gap to the next frame, almost certainly mid-sleep.
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) && sim.Snapshot().Distance != 50 {
+		time.Sleep(2 * time.Millisecond)
+	}
+	if sim.Snapshot().Distance != 50 {
+		t.Fatal("timed out waiting for playback to reach the 5th stroke")
+	}
+	time.Sleep(strokeGap / 2) // now solidly inside the inter-frame sleep
+
+	// Request a restart WITHOUT touching the state machine at all -- state
+	// stays INUSE throughout, mirroring the race this fixes: nothing here
+	// ever goes through a "not INUSE" transition for Play()'s poll to catch.
+	sim.RequestRestart()
+
+	deadline = time.Now().Add(250 * time.Millisecond)
+	backAtStart := false
+	for time.Now().Before(deadline) {
+		if sim.Snapshot().Distance == 10 {
+			backAtStart = true
+			break
+		}
+		time.Sleep(2 * time.Millisecond)
+	}
+	if !backAtStart {
+		t.Fatal("RequestRestart did not promptly restart playback from the first stroke")
+	}
+}

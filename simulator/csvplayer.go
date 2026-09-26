@@ -240,15 +240,25 @@ func (t *CSVTimeline) Play(sim *Simulator) {
 func (t *CSVTimeline) playOnce(sim *Simulator) {
 	base := t.frames[t.startIdx].at
 	realStart := time.Now()
+	restart := sim.restartSignal()
 
 	for i := t.startIdx; i <= t.endIdx; i++ {
 		if sim.sm.GetState() != sim.sm.INUSE {
 			return
 		}
+		select {
+		case <-restart:
+			return
+		default:
+		}
 
 		f := t.frames[i]
 		if wait := f.at.Sub(base) - time.Since(realStart); wait > 0 {
-			time.Sleep(wait)
+			select {
+			case <-restart:
+				return
+			case <-time.After(wait):
+			}
 		}
 
 		sim.applyFrame(f.state)
