@@ -218,6 +218,65 @@ func TestCSVTimeline_Play_RespectsStateMachineAndLoops(t *testing.T) {
 	}
 }
 
+func TestCSVTimeline_Play_AccumulatesAcrossLoopWraps(t *testing.T) {
+	// Same 2-playable-stroke recording as TestCSVTimeline_Play_RespectsStateMachineAndLoops
+	// (distance climbs 0->10->20 within one pass, stroke 3 at distance 30 is
+	// cut as incomplete): after wrapping back to the first stroke once, a
+	// second pass must NOT reset to the file's raw 0/10/20 again -- it
+	// should keep climbing past where the first pass left off (20->30->40).
+	body := ""
+	at := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+	for i := 1; i <= 3; i++ {
+		ts := at.Format(csvTimeLayout)
+		body += ts + ",general.rowing_state,1\n"
+		body += ts + ",general.stroke_state,2\n"
+		body += ts + ",general.distance," + strconv.Itoa(i*10) + "\n"
+		body += ts + ",stroke.count," + strconv.Itoa(i) + "\n"
+		at = at.Add(20 * time.Millisecond)
+	}
+	path := writeCSV(t, body)
+
+	timeline, err := LoadCSVTimeline(path)
+	if err != nil {
+		t.Fatalf("LoadCSVTimeline: %v", err)
+	}
+
+	machine := sm.NewStateMachine()
+	machine.Reset()
+	_ = machine.Update(config.CSAFE_GOIDLE_CMD)
+	_ = machine.Update(config.CSAFE_GOHAVEID_CMD)
+	_ = machine.Update(config.CSAFE_GOINUSE_CMD)
+
+	sim := NewSimulator(machine)
+	go timeline.Play(sim)
+
+	waitForDistance := func(want float64) {
+		t.Helper()
+		deadline := time.Now().Add(2 * time.Second)
+		for time.Now().Before(deadline) {
+			if sim.Snapshot().Distance == want {
+				return
+			}
+			time.Sleep(2 * time.Millisecond)
+		}
+		t.Fatalf("timed out waiting for distance=%v (last seen: %v)", want, sim.Snapshot().Distance)
+	}
+
+	waitForDistance(20) // end of pass 1 (raw file value)
+	waitForDistance(40) // end of pass 2: 20 (offset from pass 1) + 20 (raw)
+
+	// Never observe a plain reset back down to the file's own raw distance
+	// once we're accumulating -- poll the rest of a 3rd pass and require
+	// every reading from here on to be >= 40.
+	deadline := time.Now().Add(300 * time.Millisecond)
+	for time.Now().Before(deadline) {
+		if d := sim.Snapshot().Distance; d < 40 {
+			t.Fatalf("distance dropped back to %v after reaching 40 -- not accumulating across the loop wrap", d)
+		}
+		time.Sleep(2 * time.Millisecond)
+	}
+}
+
 func TestCSVTimeline_RequestRestart_InterruptsMidSleep(t *testing.T) {
 	// 20 strokes, 300ms apart: a full natural loop takes ~6s, long enough
 	// that "back at the first stroke" within a couple hundred ms can only

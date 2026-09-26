@@ -223,32 +223,75 @@ func (t *CSVTimeline) computeBounds() error {
 	return nil
 }
 
+// cumulativeOffset carries the "since actual workout start" totals forward
+// across natural loop wraps, so a continuously-INUSE session keeps
+// accumulating elapsed time/distance/calories/stroke count indefinitely
+// instead of the file's own recorded (and much smaller) absolute values
+// resetting every time playback wraps back to the first stroke. It resets
+// to zero whenever a genuinely new workout begins (an explicit restart or
+// reconnect), which is the one case where snapping back to zero is correct.
+type cumulativeOffset struct {
+	elapsed  time.Duration
+	distance float64
+	calories float64
+	strokes  uint16
+}
+
+// add returns f's state with this offset applied to its cumulative-since-
+// start fields; everything else (instantaneous readings, per-stroke data,
+// workout config/targets) is left exactly as recorded.
+func (o cumulativeOffset) add(s LiveState) LiveState {
+	s.ElapsedTime += o.elapsed
+	s.Distance += o.distance
+	s.TotalCalories += o.calories
+	s.StrokeCount += o.strokes
+	return s
+}
+
 // Play advances the timeline forever, replaying frames[startIdx..endIdx] in
 // a loop whenever the shared state machine reports INUSE, and idling
 // otherwise. A paused/reset/reconnected session always resumes from the
-// first stroke (startIdx) once INUSE again, not wherever it left off.
+// first stroke (startIdx) once INUSE again, with cumulative totals reset to
+// zero; a natural loop wrap (reaching the end of a confirmed-complete pass)
+// instead keeps accumulating them, since it's still the same ongoing row.
 func (t *CSVTimeline) Play(sim *Simulator) {
+	var offset cumulativeOffset
 	for {
 		if sim.sm.GetState() != sim.sm.INUSE {
 			time.Sleep(200 * time.Millisecond)
+			offset = cumulativeOffset{}
 			continue
 		}
-		t.playOnce(sim)
+
+		completed := t.playOnce(sim, offset)
+		if !completed {
+			offset = cumulativeOffset{}
+			continue
+		}
+
+		start, end := t.frames[t.startIdx].state, t.frames[t.endIdx].state
+		offset.elapsed += end.ElapsedTime - start.ElapsedTime
+		offset.distance += end.Distance - start.Distance
+		offset.calories += end.TotalCalories - start.TotalCalories
+		offset.strokes += end.StrokeCount - start.StrokeCount
 	}
 }
 
-func (t *CSVTimeline) playOnce(sim *Simulator) {
+// playOnce replays one pass over frames[startIdx..endIdx] with offset
+// applied, returning true if it ran to completion or false if it was cut
+// short by a restart signal or the state machine leaving INUSE.
+func (t *CSVTimeline) playOnce(sim *Simulator, offset cumulativeOffset) (completed bool) {
 	base := t.frames[t.startIdx].at
 	realStart := time.Now()
 	restart := sim.restartSignal()
 
 	for i := t.startIdx; i <= t.endIdx; i++ {
 		if sim.sm.GetState() != sim.sm.INUSE {
-			return
+			return false
 		}
 		select {
 		case <-restart:
-			return
+			return false
 		default:
 		}
 
@@ -256,14 +299,15 @@ func (t *CSVTimeline) playOnce(sim *Simulator) {
 		if wait := f.at.Sub(base) - time.Since(realStart); wait > 0 {
 			select {
 			case <-restart:
-				return
+				return false
 			case <-time.After(wait):
 			}
 		}
 
-		sim.applyFrame(f.state)
+		sim.applyFrame(offset.add(f.state))
 		if f.forceCurve != nil {
 			sim.publishForceCurve(f.forceCurve)
 		}
 	}
+	return true
 }
