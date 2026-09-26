@@ -99,6 +99,18 @@ func (em *Emulator) registerHandlers(sim *simulator.Simulator, autoStart bool) {
 		gatt.CentralDisconnected(func(c gatt.Central) {
 			logrus.Info("|Device Disconnected| ID=> ", c.ID())
 			logrus.Info("MTU: ", c.MTU())
+
+			// This emulator only ever serves one central at a time
+			// (gatt.LnxMaxConnections(1)), so every disconnect is the last
+			// client leaving: stop generating/advancing data (the state
+			// machine leaving INUSE is what gates both the physics tick
+			// and CSV playback loops) rather than letting it keep running
+			// unattended in the background until whoever reconnects next
+			// happens to reset it.
+			em.stateMachine.Reset()
+			sim.Reset()
+			sim.RequestRestart()
+			logrus.Info("no client connected: stopped generating workout data")
 		}),
 	)
 }
