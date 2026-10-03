@@ -133,6 +133,8 @@ func handleCommand(machine *sm.StateMachine, sim *simulator.Simulator, cmd byte,
 			// pass happened to be.
 			sim.RequestRestart()
 		}
+	case byte(csafe.SETPMCFG_CMD):
+		applyPMConfig(machine, sim, data)
 	case byte(csafe.SETTWORK_CMD):
 		applySetTwork(sim, data)
 	case byte(csafe.SETHORIZONTAL_CMD):
@@ -212,4 +214,46 @@ func slaveStateFlag(machine *sm.StateMachine) byte {
 	default:
 		return csafe.SLAVESTATE_ERR_FLG
 	}
+}
+
+// Screen type/value codes for the CSAFE_PM_SET_SCREENSTATE command (see the Concept2 PM CSAFE
+// Communication Definition, "Screen Type" and "Screen Value (Workout Type)").
+const (
+	screenTypeWorkout           = 0x01
+	screenValueTerminateWorkout = 0x02
+)
+
+// applyPMConfig handles the C2 proprietary SETPMCFG wrapper, whose payload is a sequence of
+// [command, byte count, data...] entries. Only CSAFE_PM_SET_SCREENSTATE with
+// SCREENTYPE_WORKOUT/TERMINATEWORKOUT is acted on: it is the "Terminate Workout" command, which
+// per the spec's PM state transitions takes a running workout through Terminate -> Rearm ->
+// WaitToBegin, i.e. back to the idle state, which also stops the simulator.
+func applyPMConfig(machine *sm.StateMachine, sim *simulator.Simulator, data []byte) {
+	for i := 0; i+1 < len(data); {
+		cmd, n := data[i], int(data[i+1])
+		if i+2+n > len(data) {
+			return
+		}
+		payload := data[i+2 : i+2+n]
+		i += 2 + n
+
+		if cmd == byte(csafe.PM_SET_SCREENSTATE) && len(payload) >= 2 &&
+			payload[0] == screenTypeWorkout && payload[1] == screenValueTerminateWorkout {
+			terminateWorkout(machine, sim)
+		}
+	}
+}
+
+// terminateWorkout ends the current workout and rearms the PM to the idle ("wait to begin")
+// state, whatever state it was in.
+func terminateWorkout(machine *sm.StateMachine, sim *simulator.Simulator) {
+	if machine.GetStateName() == config.PM5_STATE_INUSE || machine.GetStateName() == config.PM5_STATE_PAUSED {
+		if err := machine.Update(config.CSAFE_GOFINISHED_CMD); err != nil {
+			logrus.Debugf("[[Control]] terminate: GOFINISHED rejected in state %s: %v", machine.GetStateName(), err)
+		}
+	}
+	if err := machine.Update(config.CSAFE_GOIDLE_CMD); err != nil {
+		logrus.Debugf("[[Control]] terminate: GOIDLE rejected in state %s: %v", machine.GetStateName(), err)
+	}
+	sim.Reset()
 }
