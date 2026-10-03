@@ -100,8 +100,10 @@ func forceCurveNotifyLoop(n gatt.Notifier, points <-chan []uint16, unsubscribe f
 			if maxPointsPerPacket > 15 {
 				maxPointsPerPacket = 15
 			}
+			logrus.Infof("[[ForceCurve]] sending %d points, up to %d per packet", len(pts), maxPointsPerPacket)
 			for _, packet := range rowing.EncodeForceCurvePackets(pts, maxPointsPerPacket) {
 				if _, err := writeNotification(n, packet); err != nil {
+					logrus.Warnf("[[ForceCurve]] notification write failed: %v", err)
 					return
 				}
 			}
