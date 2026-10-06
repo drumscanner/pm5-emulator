@@ -1,6 +1,7 @@
 package service
 
 import (
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -221,13 +222,39 @@ func slaveStateFlag(machine *sm.StateMachine) byte {
 const (
 	screenTypeWorkout           = 0x01
 	screenValueTerminateWorkout = 0x02
+	screenValuePrepareToRow     = 0x01
+)
+
+// Commands inside the C2 proprietary SETPMCFG wrapper that configure a workout, and the unit
+// identifiers of a workout duration.
+const (
+	pmSetWorkoutType     = 0x01
+	pmSetWorkoutDuration = 0x03
+
+	durationIdentifierTime     = 0x00 // hundredths of a second
+	durationIdentifierCalories = 0x40
+	durationIdentifierDistance = 0x80 // meters
+)
+
+// The workout a client has configured with SET_WORKOUTTYPE / SET_WORKOUTDURATION. Clients send
+// each of those commands in its own frame, so it is kept between frames until the workout is
+// started (SCREENVALUEWORKOUT_PREPARETOROWWORKOUT).
+var (
+	pmWorkoutMu     sync.Mutex
+	pmWorkoutConfig simulator.WorkoutConfig
 )
 
 // applyPMConfig handles the C2 proprietary SETPMCFG wrapper, whose payload is a sequence of
-// [command, byte count, data...] entries. Only CSAFE_PM_SET_SCREENSTATE with
-// SCREENTYPE_WORKOUT/TERMINATEWORKOUT is acted on: it is the "Terminate Workout" command, which
-// per the spec's PM state transitions takes a running workout through Terminate -> Rearm ->
-// WaitToBegin, i.e. back to the idle state, which also stops the simulator.
+// [command, byte count, data...] entries:
+//   - SET_WORKOUTTYPE and SET_WORKOUTDURATION configure the workout to be started.
+//   - SET_SCREENSTATE with SCREENTYPE_WORKOUT/PREPARETOROWWORKOUT starts that workout, as the
+//     PM does once the rower begins pulling.
+//   - SET_SCREENSTATE with SCREENTYPE_WORKOUT/TERMINATEWORKOUT is the "Terminate Workout"
+//     command, which per the spec's PM state transitions takes a running workout through
+//     Terminate -> Rearm -> WaitToBegin, i.e. back to the idle state, which also stops the
+//     simulator.
+//
+// Rest durations and splits are accepted but not modeled.
 func applyPMConfig(machine *sm.StateMachine, sim *simulator.Simulator, data []byte) {
 	for i := 0; i+1 < len(data); {
 		cmd, n := data[i], int(data[i+1])
@@ -237,11 +264,59 @@ func applyPMConfig(machine *sm.StateMachine, sim *simulator.Simulator, data []by
 		payload := data[i+2 : i+2+n]
 		i += 2 + n
 
-		if cmd == byte(csafe.PM_SET_SCREENSTATE) && len(payload) >= 2 &&
-			payload[0] == screenTypeWorkout && payload[1] == screenValueTerminateWorkout {
-			terminateWorkout(machine, sim)
+		switch {
+		case cmd == pmSetWorkoutType && len(payload) >= 1:
+			pmWorkoutMu.Lock()
+			pmWorkoutConfig = simulator.WorkoutConfig{WorkoutType: payload[0]}
+			pmWorkoutMu.Unlock()
+		case cmd == pmSetWorkoutDuration && len(payload) >= 5:
+			applyPMWorkoutDuration(payload)
+		case cmd == byte(csafe.PM_SET_SCREENSTATE) && len(payload) >= 2 && payload[0] == screenTypeWorkout:
+			switch payload[1] {
+			case screenValueTerminateWorkout:
+				terminateWorkout(machine, sim)
+			case screenValuePrepareToRow:
+				startWorkout(machine, sim)
+			}
 		}
 	}
+}
+
+// applyPMWorkoutDuration records the goal of a SET_WORKOUTDURATION payload: a unit identifier
+// followed by a big-endian 32-bit value.
+func applyPMWorkoutDuration(payload []byte) {
+	value := uint32(payload[1])<<24 | uint32(payload[2])<<16 | uint32(payload[3])<<8 | uint32(payload[4])
+
+	pmWorkoutMu.Lock()
+	defer pmWorkoutMu.Unlock()
+	switch payload[0] {
+	case durationIdentifierTime:
+		pmWorkoutConfig.DurationType = config.CSAFE_TIME_DURATION
+		pmWorkoutConfig.TargetDuration = time.Duration(value) * 10 * time.Millisecond
+	case durationIdentifierDistance:
+		pmWorkoutConfig.DurationType = config.CSAFE_DISTANCE_DURATION
+		pmWorkoutConfig.TargetDistance = float64(value)
+	case durationIdentifierCalories:
+		// Calorie goals aren't modeled; the workout runs without an end.
+	}
+}
+
+// startWorkout applies the configured workout and starts it from the beginning, whatever state
+// the PM was in.
+func startWorkout(machine *sm.StateMachine, sim *simulator.Simulator) {
+	pmWorkoutMu.Lock()
+	cfg := pmWorkoutConfig
+	pmWorkoutMu.Unlock()
+	sim.ConfigureWorkout(cfg)
+
+	if machine.GetStateName() == config.PM5_STATE_FINISHED {
+		// The finished state does move to idle, but reports an error while doing so.
+		_ = machine.Update(config.CSAFE_GOIDLE_CMD)
+	}
+	if err := machine.Update(config.CSAFE_GOINUSE_CMD); err != nil {
+		logrus.Debugf("[[Control]] start: GOINUSE rejected in state %s: %v", machine.GetStateName(), err)
+	}
+	sim.RequestRestart()
 }
 
 // terminateWorkout ends the current workout and rearms the PM to the idle ("wait to begin")
