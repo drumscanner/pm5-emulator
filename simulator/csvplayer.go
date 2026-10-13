@@ -251,21 +251,37 @@ func (o cumulativeOffset) add(s LiveState) LiveState {
 // Play advances the timeline forever, replaying frames[startIdx..endIdx] in
 // a loop whenever the shared state machine reports INUSE, and idling
 // otherwise. A paused/reset/reconnected session always resumes from the
-// first stroke (startIdx) once INUSE again, with cumulative totals reset to
-// zero; a natural loop wrap (reaching the end of a confirmed-complete pass)
-// instead keeps accumulating them, since it's still the same ongoing row.
+// first stroke (startIdx) once INUSE again, with cumulative totals (and any
+// configured interval schedule's position) reset to the start; a natural
+// loop wrap (reaching the end of a confirmed-complete pass) instead keeps
+// accumulating/advancing them, since it's still the same ongoing row.
+//
+// If an interval schedule is configured on sim (see Simulator.ConfigureWorkout),
+// each frame's resulting Distance/ElapsedTime/TotalCalories -- which keep
+// climbing continuously across the whole recording, work or rest -- drive
+// the exact same advanceIntervalPhase logic the physics simulator uses, so
+// the file (which has no rest periods recorded in it at all) only ever
+// needs its WorkoutState/IntervalType/RestTime/RestDistance/IntervalCount
+// relabeled for the current phase; nothing about how the file itself is
+// consumed changes between work and rest.
 func (t *CSVTimeline) Play(sim *Simulator) {
 	var offset cumulativeOffset
+	var phase intervalPhase
+	var scheduleIdx int
 	for {
 		if sim.sm.GetState() != sim.sm.INUSE {
 			time.Sleep(200 * time.Millisecond)
-			offset = cumulativeOffset{}
+			offset, phase, scheduleIdx = cumulativeOffset{}, intervalPhase{}, 0
 			continue
 		}
 
-		completed := t.playOnce(sim, offset)
+		completed, scheduleDone := t.playOnce(sim, offset, &phase, &scheduleIdx)
+		if scheduleDone {
+			sim.finishWorkout()
+			continue
+		}
 		if !completed {
-			offset = cumulativeOffset{}
+			offset, phase, scheduleIdx = cumulativeOffset{}, intervalPhase{}, 0
 			continue
 		}
 
@@ -278,20 +294,24 @@ func (t *CSVTimeline) Play(sim *Simulator) {
 }
 
 // playOnce replays one pass over frames[startIdx..endIdx] with offset
-// applied, returning true if it ran to completion or false if it was cut
-// short by a restart signal or the state machine leaving INUSE.
-func (t *CSVTimeline) playOnce(sim *Simulator, offset cumulativeOffset) (completed bool) {
+// applied (and, if configured, the interval schedule tracked via phase/
+// scheduleIdx overlaid), returning completed=true if it ran to completion.
+// scheduleDone is true if an interval schedule was configured, doesn't
+// repeat, and was exhausted mid-pass -- the caller must react to it (end
+// the workout) rather than treating it like any other interruption.
+func (t *CSVTimeline) playOnce(sim *Simulator, offset cumulativeOffset, phase *intervalPhase, scheduleIdx *int) (completed, scheduleDone bool) {
+	schedule, repeat := sim.intervalSchedule()
 	base := t.frames[t.startIdx].at
 	realStart := time.Now()
 	restart := sim.restartSignal()
 
 	for i := t.startIdx; i <= t.endIdx; i++ {
 		if sim.sm.GetState() != sim.sm.INUSE {
-			return false
+			return false, false
 		}
 		select {
 		case <-restart:
-			return false
+			return false, false
 		default:
 		}
 
@@ -299,15 +319,34 @@ func (t *CSVTimeline) playOnce(sim *Simulator, offset cumulativeOffset) (complet
 		if wait := f.at.Sub(base) - time.Since(realStart); wait > 0 {
 			select {
 			case <-restart:
-				return false
+				return false, false
 			case <-time.After(wait):
 			}
 		}
 
-		sim.applyFrame(offset.add(f.state))
+		state := offset.add(f.state)
+		if len(schedule) > 0 {
+			fields, done := advanceIntervalPhase(phase, schedule, scheduleIdx, repeat,
+				state.ElapsedTime, state.Distance, state.TotalCalories)
+			state.WorkoutState = fields.WorkoutState
+			state.IntervalType = fields.IntervalType
+			state.RestTime = fields.RestTime
+			state.RestDistance = fields.RestDistance
+			state.IntervalCount = fields.IntervalCount
+			sim.applyFrame(state)
+			if f.forceCurve != nil {
+				sim.publishForceCurve(f.forceCurve)
+			}
+			if done {
+				return true, true
+			}
+			continue
+		}
+
+		sim.applyFrame(state)
 		if f.forceCurve != nil {
 			sim.publishForceCurve(f.forceCurve)
 		}
 	}
-	return true
+	return true, false
 }

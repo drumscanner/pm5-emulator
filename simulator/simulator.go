@@ -18,20 +18,37 @@ const (
 )
 
 // WorkoutConfig describes the workout a CSAFE client configured via
-// SETTWORK/SETHORIZONTAL/SETPROGRAM/etc.
+// SETTWORK/SETHORIZONTAL/SETPROGRAM/etc. (flat fields, a single goal) or via
+// the proprietary SETPMCFG workout-programming commands (Intervals, a
+// schedule of one or more work/rest goals).
 type WorkoutConfig struct {
 	WorkoutType    byte
 	DurationType   byte
 	TargetDistance float64       // meters, 0 = unlimited ("just row")
 	TargetDuration time.Duration // 0 = unlimited
 	TargetPaceSec  float64       // seconds per 500m; 0 = keep current pace
-	TargetCalories float64       // calories of one interval, for calorie intervals
 
-	// Interval workouts repeat the goal above, with a rest between repetitions, until terminated.
-	// The rower keeps rowing through the rest, so distance, time and calories keep accumulating.
-	Interval      bool
-	RestDuration  time.Duration
-	RestUndefined bool // no set rest length; the emulator rests for undefinedRestDuration
+	// Intervals, if non-empty, makes this an interval workout: the rower
+	// keeps rowing through each interval's rest (distance/time/calories
+	// keep accumulating -- only the reported workout/interval state
+	// changes), advancing through Intervals in order. Repeat cycles back
+	// to the first one indefinitely (until Terminate) instead of finishing
+	// after the last one -- "single"/"constant repeatable" workouts with
+	// no explicit count use this to match a real PM5 repeating until
+	// stopped; "variable repeatable" and any workout with an explicit
+	// finite count do not.
+	Intervals []IntervalSpec
+	Repeat    bool
+}
+
+// IntervalSpec is one interval's work goal and the rest that follows it.
+type IntervalSpec struct {
+	DurationType   byte // config.CSAFE_TIME_DURATION / CSAFE_DISTANCE_DURATION / CSAFE_CALORIES_DURATION
+	TargetDuration time.Duration
+	TargetDistance float64
+	TargetCalories float64
+	RestDuration   time.Duration
+	RestUndefined  bool // no set rest length; the emulator rests for undefinedRestDuration
 }
 
 // How long a rest without a set length lasts here; a real PM5 waits for the rower to start again.
@@ -59,15 +76,12 @@ type Simulator struct {
 	lastSplitElapsed  time.Duration
 	strokePhase       time.Duration
 
-	// Interval workouts: the current work or rest phase and where it began.
-	interval       bool
-	targetCalories float64
-	restDuration   time.Duration
-	restUndefined  bool
-	inRest         bool
-	phaseElapsed   time.Duration
-	phaseDistance  float64
-	phaseCalories  float64
+	// Interval workouts: the configured schedule, which interval is
+	// current, and the current work/rest phase's own progress.
+	schedule    []IntervalSpec
+	scheduleIdx int
+	repeat      bool
+	phase       intervalPhase
 
 	rng *rand.Rand
 
@@ -239,14 +253,23 @@ func (s *Simulator) ConfigureWorkout(cfg WorkoutConfig) {
 	s.durationType = cfg.DurationType
 	s.targetDistance = cfg.TargetDistance
 	s.targetDuration = cfg.TargetDuration
-	s.targetCalories = cfg.TargetCalories
-	s.interval = cfg.Interval
-	s.restDuration = cfg.RestDuration
-	s.restUndefined = cfg.RestUndefined
+	s.schedule = cfg.Intervals
+	s.repeat = cfg.Repeat
 	if cfg.TargetPaceSec > 0 {
 		s.targetSplitSec = cfg.TargetPaceSec
 	}
 	s.resetLocked()
+}
+
+// intervalSchedule returns a thread-safe snapshot of the configured interval
+// schedule (nil/empty if this isn't an interval workout) and whether it
+// repeats, for callers -- the CSV player -- that aren't otherwise
+// synchronized with ConfigureWorkout. s.schedule is always replaced
+// wholesale (never mutated in place), so returning the slice itself is safe.
+func (s *Simulator) intervalSchedule() (schedule []IntervalSpec, repeat bool) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.schedule, s.repeat
 }
 
 // Reset zeroes the live workout counters (elapsed time, distance, calories,
@@ -262,10 +285,8 @@ func (s *Simulator) resetLocked() {
 	s.lastSplitDistance = 0
 	s.lastSplitElapsed = 0
 	s.strokePhase = 0
-	s.inRest = false
-	s.phaseElapsed = 0
-	s.phaseDistance = 0
-	s.phaseCalories = 0
+	s.scheduleIdx = 0
+	s.phase = intervalPhase{}
 }
 
 // newLiveState returns the correct "nothing happening yet" defaults: heart
@@ -351,88 +372,141 @@ func (s *Simulator) tick(dt time.Duration) {
 	s.state.RowingState = config.ROWINGSTATE_ACTIVE
 
 	s.updateStroke(dt, speed, power)
-	if s.interval {
-		s.updateInterval()
+	if len(s.schedule) > 0 {
+		fields, scheduleDone := advanceIntervalPhase(&s.phase, s.schedule, &s.scheduleIdx, s.repeat,
+			s.state.ElapsedTime, s.state.Distance, s.state.TotalCalories)
+		s.state.WorkoutState = fields.WorkoutState
+		s.state.IntervalType = fields.IntervalType
+		s.state.RestTime = fields.RestTime
+		s.state.RestDistance = fields.RestDistance
+		s.state.IntervalCount = fields.IntervalCount
+		if scheduleDone {
+			s.finishWorkoutLocked()
+		}
 		return
 	}
 	s.updateSplit()
 	s.checkWorkoutComplete()
 }
 
-// updateInterval runs the work and rest phases of an interval workout. Time, distance and
-// calories keep accumulating through the rest, as the rower goes on rowing; the rest only changes
-// the reported workout state and interval type, and counts its own time and distance.
-func (s *Simulator) updateInterval() {
-	if s.state.IntervalCount == 0 {
-		s.state.IntervalCount = 1
-	}
-	phaseTime := s.state.ElapsedTime - s.phaseElapsed
-	phaseDistance := s.state.Distance - s.phaseDistance
-	phaseCalories := s.state.TotalCalories - s.phaseCalories
-
-	if s.inRest {
-		s.state.WorkoutState = config.WORKOUTSTATE_INTERVALREST
-		s.state.IntervalType = config.INTERVALTYPE_REST
-		s.state.RestTime = phaseTime
-		s.state.RestDistance = phaseDistance
-		rest := s.restDuration
-		if s.restUndefined {
-			s.state.IntervalType = config.INTERVALTYPE_RESTUNDEFINED
-			rest = undefinedRestDuration
-		}
-		if phaseTime >= rest {
-			s.inRest = false
-			s.state.IntervalCount++
-			s.beginPhase()
-		}
-		return
-	}
-
-	switch s.durationType {
-	case config.CSAFE_DISTANCE_DURATION:
-		s.state.WorkoutState = config.WORKOUTSTATE_INTERVALWORKDISTANCE
-		s.state.IntervalType = config.INTERVALTYPE_DIST
-	case config.CSAFE_CALORIES_DURATION:
-		s.state.WorkoutState = config.WORKOUTSTATE_INTERVALWORKDISTANCE
-		s.state.IntervalType = config.INTERVALTYPE_CAL
-	default:
-		s.state.WorkoutState = config.WORKOUTSTATE_INTERVALWORKTIME
-		s.state.IntervalType = config.INTERVALTYPE_TIME
-	}
-	if s.restUndefined {
-		switch s.state.IntervalType {
-		case config.INTERVALTYPE_TIME:
-			s.state.IntervalType = config.INTERVALTYPE_TIMERESTUNDEFINED
-		case config.INTERVALTYPE_DIST:
-			s.state.IntervalType = config.INTERVALTYPE_DISTANCERESTUNDEFINED
-		case config.INTERVALTYPE_CAL:
-			s.state.IntervalType = config.INTERVALTYPE_CALRESTUNDEFINED
-		}
-	}
-	s.state.RestTime = 0
-	s.state.RestDistance = 0
-
-	done := false
-	switch s.durationType {
-	case config.CSAFE_DISTANCE_DURATION:
-		done = phaseDistance >= s.targetDistance
-	case config.CSAFE_CALORIES_DURATION:
-		done = phaseCalories >= s.targetCalories
-	default:
-		done = phaseTime >= s.targetDuration
-	}
-	if done {
-		s.inRest = true
-		s.state.WorkoutState = config.WORKOUTSTATE_INTERVALREST
-		s.state.IntervalType = config.INTERVALTYPE_REST
-		s.beginPhase()
-	}
+// intervalPhase tracks progress through the current work or rest phase of an
+// interval schedule. It's shared state for advanceIntervalPhase, used both by
+// Simulator.tick (the physics engine) and CSVTimeline.playOnce (the CSV
+// player), so the two data sources drive identical work/rest transitions
+// from exactly the same logic instead of two implementations that could
+// drift apart.
+type intervalPhase struct {
+	inRest        bool
+	intervalCount byte
+	phaseElapsed  time.Duration
+	phaseDistance float64
+	phaseCalories float64
 }
 
-func (s *Simulator) beginPhase() {
-	s.phaseElapsed = s.state.ElapsedTime
-	s.phaseDistance = s.state.Distance
-	s.phaseCalories = s.state.TotalCalories
+// intervalFields is the subset of LiveState that advanceIntervalPhase
+// computes from an interval schedule.
+type intervalFields struct {
+	WorkoutState  byte
+	IntervalType  byte
+	RestTime      time.Duration
+	RestDistance  float64
+	IntervalCount byte
+}
+
+// advanceIntervalPhase runs the work and rest phases of an interval
+// schedule. Time, distance and calories keep accumulating through the rest,
+// as the rower goes on rowing; the rest only changes the reported workout
+// state and interval type, and counts its own time and distance (via the
+// returned RestTime/RestDistance).
+//
+// elapsed/distance/calories are the CUMULATIVE values since the whole
+// workout started (ps's own phaseElapsed/phaseDistance/phaseCalories track
+// where the *current* phase began, exactly as Simulator.tick's caller
+// already did before this was extracted). scheduleDone is true only once,
+// the moment the schedule is exhausted and !repeat -- the caller is
+// responsible for reacting to it (ending the workout); a repeating schedule
+// never returns it.
+func advanceIntervalPhase(ps *intervalPhase, schedule []IntervalSpec, scheduleIdx *int, repeat bool,
+	elapsed time.Duration, distance, calories float64) (fields intervalFields, scheduleDone bool) {
+	if len(schedule) == 0 {
+		return intervalFields{}, false
+	}
+	if ps.intervalCount == 0 {
+		ps.intervalCount = 1
+	}
+	spec := schedule[*scheduleIdx]
+
+	phaseTime := elapsed - ps.phaseElapsed
+	phaseDistance := distance - ps.phaseDistance
+	phaseCalories := calories - ps.phaseCalories
+
+	if ps.inRest {
+		fields.WorkoutState = config.WORKOUTSTATE_INTERVALREST
+		fields.IntervalType = config.INTERVALTYPE_REST
+		fields.RestTime = phaseTime
+		fields.RestDistance = phaseDistance
+		rest := spec.RestDuration
+		if spec.RestUndefined {
+			fields.IntervalType = config.INTERVALTYPE_RESTUNDEFINED
+			rest = undefinedRestDuration
+		}
+		fields.IntervalCount = ps.intervalCount
+
+		if phaseTime >= rest {
+			ps.inRest = false
+			ps.intervalCount++
+			ps.phaseElapsed, ps.phaseDistance, ps.phaseCalories = elapsed, distance, calories
+
+			*scheduleIdx++
+			if *scheduleIdx >= len(schedule) {
+				if !repeat {
+					return fields, true
+				}
+				*scheduleIdx = 0
+			}
+		}
+		return fields, false
+	}
+
+	switch spec.DurationType {
+	case config.CSAFE_DISTANCE_DURATION:
+		fields.WorkoutState = config.WORKOUTSTATE_INTERVALWORKDISTANCE
+		fields.IntervalType = config.INTERVALTYPE_DIST
+	case config.CSAFE_CALORIES_DURATION:
+		fields.WorkoutState = config.WORKOUTSTATE_INTERVALWORKDISTANCE
+		fields.IntervalType = config.INTERVALTYPE_CAL
+	default:
+		fields.WorkoutState = config.WORKOUTSTATE_INTERVALWORKTIME
+		fields.IntervalType = config.INTERVALTYPE_TIME
+	}
+	if spec.RestUndefined {
+		switch fields.IntervalType {
+		case config.INTERVALTYPE_TIME:
+			fields.IntervalType = config.INTERVALTYPE_TIMERESTUNDEFINED
+		case config.INTERVALTYPE_DIST:
+			fields.IntervalType = config.INTERVALTYPE_DISTANCERESTUNDEFINED
+		case config.INTERVALTYPE_CAL:
+			fields.IntervalType = config.INTERVALTYPE_CALRESTUNDEFINED
+		}
+	}
+	fields.IntervalCount = ps.intervalCount
+
+	done := false
+	switch spec.DurationType {
+	case config.CSAFE_DISTANCE_DURATION:
+		done = phaseDistance >= spec.TargetDistance
+	case config.CSAFE_CALORIES_DURATION:
+		done = phaseCalories >= spec.TargetCalories
+	default:
+		done = phaseTime >= spec.TargetDuration
+	}
+	if done {
+		ps.inRest = true
+		fields.WorkoutState = config.WORKOUTSTATE_INTERVALREST
+		fields.IntervalType = config.INTERVALTYPE_REST
+		ps.phaseElapsed, ps.phaseDistance, ps.phaseCalories = elapsed, distance, calories
+	}
+	return fields, false
 }
 
 func (s *Simulator) updateStroke(dt time.Duration, speed, power float64) {
@@ -495,7 +569,15 @@ func (s *Simulator) checkWorkoutComplete() {
 	if !done {
 		return
 	}
+	s.finishWorkoutLocked()
+}
 
+// finishWorkoutLocked marks the current snapshot as a completed workout and
+// moves the shared state machine to FINISHED. Shared by the flat-target
+// (checkWorkoutComplete) and interval-schedule-exhausted (tick) paths. The
+// caller must already hold s.mu -- both of those do, since they're called
+// from within tick().
+func (s *Simulator) finishWorkoutLocked() {
 	s.state.WorkoutState = config.WORKOUTSTATE_WORKOUTEND
 	s.state.RowingState = config.ROWINGSTATE_INACTIVE
 	s.state.SplitIntervalSize = uint16(splitDistance)
@@ -508,6 +590,14 @@ func (s *Simulator) checkWorkoutComplete() {
 	_ = s.sm.Update(config.CSAFE_GOFINISHED_CMD)
 
 	s.publishSummary()
+}
+
+// finishWorkout is finishWorkoutLocked's counterpart for callers -- the CSV
+// player -- that don't already hold s.mu.
+func (s *Simulator) finishWorkout() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.finishWorkoutLocked()
 }
 
 // jitter returns a random value in [-amp, amp).

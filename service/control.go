@@ -228,36 +228,106 @@ const (
 // Commands inside the C2 proprietary SETPMCFG wrapper that configure a workout, and the unit
 // identifiers of a workout duration.
 const (
-	pmSetWorkoutType     = 0x01
-	pmSetWorkoutDuration = 0x03
-	pmSetRestDuration    = 0x04
-	pmSetIntervalID      = 0x07
+	pmSetWorkoutType          = 0x01
+	pmSetWorkoutDuration      = 0x03
+	pmSetRestDuration         = 0x04
+	pmSetWorkoutIntervalCount = 0x18 // CSAFE_PM_SET_WORKOUTINTERVALCOUNT
 
 	durationIdentifierTime     = 0x00 // hundredths of a second
 	durationIdentifierCalories = 0x40
 	durationIdentifierDistance = 0x80 // meters
 )
 
-// The workout a client has configured with SET_WORKOUTTYPE / SET_WORKOUTDURATION. Clients send
-// each of those commands in its own frame, so it is kept between frames until the workout is
-// started (SCREENVALUEWORKOUT_PREPARETOROWWORKOUT).
+// pmWorkoutBuilder accumulates a workout configuration across the sequence of SETPMCFG
+// sub-commands a client sends -- each in its own CSAFE frame -- until SET_SCREENSTATE /
+// PREPARETOROWWORKOUT starts it (see applyPMConfig/startWorkout). A fresh one begins each time
+// SET_WORKOUTTYPE arrives, since that's always the first command of a new configuration sequence.
+//
+// CSAFE_PM_SET_WORKOUTINTERVALCOUNT is reused by the wire protocol for two different purposes,
+// disambiguated here by workout type, per the two documented examples in the bundled CSAFE spec
+// ("Fixed Distance Interval" and "Variable Interval" in
+// docs/resources/Concept2 PM CSAFE Communication Definition.pdf): for a variable interval workout
+// it's the 0-based index of the interval group currently being configured, sent once per
+// interval, each followed by its own type/duration/rest and committed by its own
+// CONFIGURE_WORKOUT. There's no documented example of an explicit finite count for a
+// constant/single interval workout (the simplest example never sends this command at all, and
+// repeats forever until Terminate); by analogy with the variable case, this emulator treats a
+// value sent there as "repeat this one interval this many times" instead -- the one interpretive
+// call in this implementation where the bundled spec doesn't fully pin down the wire format.
+type pmWorkoutBuilder struct {
+	workoutType byte
+
+	current      simulator.IntervalSpec // the interval (or flat goal) currently being configured
+	pendingCount int                    // last SET_WORKOUTINTERVALCOUNT seen since current started; -1 = none seen
+
+	// Committed intervals: for a variable workout, one entry per interval, indexed by
+	// pendingCount at commit time; for a constant/single workout, just the one entry.
+	intervals   []simulator.IntervalSpec
+	repeatCount int // constant/single workouts only; 0 = no explicit count (repeat until Terminate)
+}
+
+func newPMWorkoutBuilder() *pmWorkoutBuilder {
+	return &pmWorkoutBuilder{pendingCount: -1}
+}
+
+func isIntervalWorkoutType(t byte) bool {
+	switch t {
+	case config.WORKOUTTYPE_FIXEDTIME_INTERVAL, config.WORKOUTTYPE_FIXEDDIST_INTERVAL, config.WORKOUTTYPE_FIXEDCALS_INTERVAL,
+		config.WORKOUTTYPE_VARIABLE_INTERVAL, config.WORKOUTTYPE_VARIABLE_UNDEFINEDREST_INTERVAL:
+		return true
+	}
+	return false
+}
+
+func isVariableWorkoutType(t byte) bool {
+	return t == config.WORKOUTTYPE_VARIABLE_INTERVAL || t == config.WORKOUTTYPE_VARIABLE_UNDEFINEDREST_INTERVAL
+}
+
+// commitInterval finalizes the interval currently being configured, in response to
+// CSAFE_PM_CONFIGURE_WORKOUT/Programming mode enable (sent once per interval for a variable
+// workout, or once overall for a single/constant one -- see the type doc comment above). Must be
+// called with pmWorkoutMu held.
+func (w *pmWorkoutBuilder) commitInterval() {
+	w.current.RestUndefined = w.workoutType == config.WORKOUTTYPE_VARIABLE_UNDEFINEDREST_INTERVAL
+
+	if isVariableWorkoutType(w.workoutType) {
+		idx := 0
+		if w.pendingCount >= 0 {
+			idx = w.pendingCount
+		}
+		for len(w.intervals) <= idx {
+			w.intervals = append(w.intervals, simulator.IntervalSpec{})
+		}
+		w.intervals[idx] = w.current
+		w.current = simulator.IntervalSpec{}
+		w.pendingCount = -1
+		return
+	}
+	if isIntervalWorkoutType(w.workoutType) && w.pendingCount >= 0 {
+		w.repeatCount = w.pendingCount
+	}
+	// Flat (non-interval) and constant-interval workouts: startWorkout reads w.current directly,
+	// nothing more to commit here.
+}
+
+// The workout a client is currently building; kept between frames until the workout is started
+// (SCREENVALUEWORKOUT_PREPARETOROWWORKOUT), at which point startWorkout consumes and resets it.
 var (
-	pmWorkoutMu     sync.Mutex
-	pmWorkoutConfig simulator.WorkoutConfig
+	pmWorkoutMu sync.Mutex
+	pmWorkout   = newPMWorkoutBuilder()
 )
 
 // applyPMConfig handles the C2 proprietary SETPMCFG wrapper, whose payload is a sequence of
 // [command, byte count, data...] entries:
-//   - SET_WORKOUTTYPE and SET_WORKOUTDURATION configure the workout to be started.
+//   - SET_WORKOUTTYPE, SET_WORKOUTDURATION, SET_RESTDURATION and SET_WORKOUTINTERVALCOUNT
+//     configure the workout (or, for a variable workout, one interval of it at a time -- see
+//     pmWorkoutBuilder) to be started.
 //   - SET_SCREENSTATE with SCREENTYPE_WORKOUT/PREPARETOROWWORKOUT starts that workout, as the
 //     PM does once the rower begins pulling.
 //   - SET_SCREENSTATE with SCREENTYPE_WORKOUT/TERMINATEWORKOUT is the "Terminate Workout"
 //     command, which per the spec's PM state transitions takes a running workout through
 //     Terminate -> Rearm -> WaitToBegin, i.e. back to the idle state, which also stops the
 //     simulator.
-//
-// Interval workouts (fixed time, distance and calorie intervals, and the undefined-rest variable
-// type holding one interval) repeat with their rest until terminated. Splits are not modeled.
 func applyPMConfig(machine *sm.StateMachine, sim *simulator.Simulator, data []byte) {
 	for i := 0; i+1 < len(data); {
 		cmd, n := data[i], int(data[i+1])
@@ -270,25 +340,23 @@ func applyPMConfig(machine *sm.StateMachine, sim *simulator.Simulator, data []by
 		switch {
 		case cmd == pmSetWorkoutType && len(payload) >= 1:
 			pmWorkoutMu.Lock()
-			pmWorkoutConfig = simulator.WorkoutConfig{WorkoutType: payload[0]}
-			switch payload[0] {
-			case config.WORKOUTTYPE_FIXEDTIME_INTERVAL, config.WORKOUTTYPE_FIXEDDIST_INTERVAL,
-				config.WORKOUTTYPE_FIXEDCALS_INTERVAL:
-				pmWorkoutConfig.Interval = true
-			case config.WORKOUTTYPE_VARIABLE_UNDEFINEDREST_INTERVAL:
-				// Only the one interval a client programs is modeled, repeated.
-				pmWorkoutConfig.Interval = true
-				pmWorkoutConfig.RestUndefined = true
-			}
+			pmWorkout = newPMWorkoutBuilder()
+			pmWorkout.workoutType = payload[0]
 			pmWorkoutMu.Unlock()
 		case cmd == pmSetWorkoutDuration && len(payload) >= 5:
 			applyPMWorkoutDuration(payload)
 		case cmd == pmSetRestDuration && len(payload) >= 2:
 			pmWorkoutMu.Lock()
-			pmWorkoutConfig.RestDuration = time.Duration(uint16(payload[0])<<8|uint16(payload[1])) * time.Second
+			pmWorkout.current.RestDuration = time.Duration(uint16(payload[0])<<8|uint16(payload[1])) * time.Second
 			pmWorkoutMu.Unlock()
-		case cmd == pmSetIntervalID:
-			// A single interval is modeled; the identifier is accepted and ignored.
+		case cmd == pmSetWorkoutIntervalCount && len(payload) >= 1:
+			pmWorkoutMu.Lock()
+			pmWorkout.pendingCount = int(payload[0])
+			pmWorkoutMu.Unlock()
+		case cmd == byte(csafe.PM_CONFIGURE_WORKOUT) && len(payload) >= 1 && payload[0] == 1:
+			pmWorkoutMu.Lock()
+			pmWorkout.commitInterval()
+			pmWorkoutMu.Unlock()
 		case cmd == byte(csafe.PM_SET_SCREENSTATE) && len(payload) >= 2 && payload[0] == screenTypeWorkout:
 			switch payload[1] {
 			case screenValueTerminateWorkout:
@@ -309,14 +377,14 @@ func applyPMWorkoutDuration(payload []byte) {
 	defer pmWorkoutMu.Unlock()
 	switch payload[0] {
 	case durationIdentifierTime:
-		pmWorkoutConfig.DurationType = config.CSAFE_TIME_DURATION
-		pmWorkoutConfig.TargetDuration = time.Duration(value) * 10 * time.Millisecond
+		pmWorkout.current.DurationType = config.CSAFE_TIME_DURATION
+		pmWorkout.current.TargetDuration = time.Duration(value) * 10 * time.Millisecond
 	case durationIdentifierDistance:
-		pmWorkoutConfig.DurationType = config.CSAFE_DISTANCE_DURATION
-		pmWorkoutConfig.TargetDistance = float64(value)
+		pmWorkout.current.DurationType = config.CSAFE_DISTANCE_DURATION
+		pmWorkout.current.TargetDistance = float64(value)
 	case durationIdentifierCalories:
-		pmWorkoutConfig.DurationType = config.CSAFE_CALORIES_DURATION
-		pmWorkoutConfig.TargetCalories = float64(value)
+		pmWorkout.current.DurationType = config.CSAFE_CALORIES_DURATION
+		pmWorkout.current.TargetCalories = float64(value)
 	}
 }
 
@@ -324,8 +392,29 @@ func applyPMWorkoutDuration(payload []byte) {
 // the PM was in.
 func startWorkout(machine *sm.StateMachine, sim *simulator.Simulator) {
 	pmWorkoutMu.Lock()
-	cfg := pmWorkoutConfig
+	w := pmWorkout
+	pmWorkout = newPMWorkoutBuilder()
 	pmWorkoutMu.Unlock()
+
+	cfg := simulator.WorkoutConfig{WorkoutType: w.workoutType}
+	switch {
+	case isVariableWorkoutType(w.workoutType):
+		cfg.Intervals = append([]simulator.IntervalSpec(nil), w.intervals...)
+	case isIntervalWorkoutType(w.workoutType):
+		if w.repeatCount > 1 {
+			cfg.Intervals = make([]simulator.IntervalSpec, w.repeatCount)
+			for i := range cfg.Intervals {
+				cfg.Intervals[i] = w.current
+			}
+		} else {
+			cfg.Intervals = []simulator.IntervalSpec{w.current}
+			cfg.Repeat = w.repeatCount == 0 // no explicit count: repeat until Terminate, matching a real PM5
+		}
+	default:
+		cfg.DurationType = w.current.DurationType
+		cfg.TargetDistance = w.current.TargetDistance
+		cfg.TargetDuration = w.current.TargetDuration
+	}
 	sim.ConfigureWorkout(cfg)
 
 	if machine.GetStateName() == config.PM5_STATE_FINISHED {

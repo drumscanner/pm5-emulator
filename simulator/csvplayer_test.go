@@ -340,3 +340,71 @@ func TestCSVTimeline_RequestRestart_InterruptsMidSleep(t *testing.T) {
 		t.Fatal("RequestRestart did not promptly restart playback from the first stroke")
 	}
 }
+
+func TestCSVTimeline_Play_IntervalSchedule(t *testing.T) {
+	// A long recording (enough strokes to cover several configured work/rest
+	// cycles without needing to loop the file) with no rest in it at all --
+	// matching "the file won't contain rest periods" -- distance/time climb
+	// steadily throughout.
+	const numStrokes = 40
+	body := ""
+	at := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+	for i := 1; i <= numStrokes; i++ {
+		ts := at.Format(csvTimeLayout)
+		body += ts + ",general.rowing_state,1\n"
+		body += ts + ",general.stroke_state,2\n"
+		body += ts + ",general.distance," + strconv.Itoa(i*10) + "\n"
+		body += ts + ",general.elapsed_time," + strconv.Itoa(i) + "\n"
+		body += ts + ",stroke.count," + strconv.Itoa(i) + "\n"
+		at = at.Add(50 * time.Millisecond)
+	}
+	path := writeCSV(t, body)
+
+	timeline, err := LoadCSVTimeline(path)
+	if err != nil {
+		t.Fatalf("LoadCSVTimeline: %v", err)
+	}
+
+	machine := sm.NewStateMachine()
+	machine.Reset()
+	_ = machine.Update(config.CSAFE_GOIDLE_CMD)
+	_ = machine.Update(config.CSAFE_GOHAVEID_CMD)
+	_ = machine.Update(config.CSAFE_GOINUSE_CMD)
+
+	sim := NewSimulator(machine)
+	sim.ConfigureWorkout(WorkoutConfig{
+		WorkoutType: config.WORKOUTTYPE_FIXEDTIME_INTERVAL,
+		Intervals: []IntervalSpec{
+			{DurationType: config.CSAFE_TIME_DURATION, TargetDuration: 300 * time.Millisecond, RestDuration: 150 * time.Millisecond},
+		},
+		Repeat: true,
+	})
+
+	go timeline.Play(sim)
+
+	deadline := time.Now().Add(3 * time.Second)
+	var sawWork, sawRest bool
+	var lastDistance float64
+	for time.Now().Before(deadline) && !(sawWork && sawRest) {
+		got := sim.Snapshot()
+		if got.Distance < lastDistance {
+			t.Fatalf("Distance went backwards: %v -> %v (should keep accumulating through rest)", lastDistance, got.Distance)
+		}
+		lastDistance = got.Distance
+
+		switch got.WorkoutState {
+		case config.WORKOUTSTATE_INTERVALWORKTIME:
+			sawWork = true
+		case config.WORKOUTSTATE_INTERVALREST:
+			sawRest = true
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+
+	if !sawWork || !sawRest {
+		t.Fatalf("expected to observe both work and rest WorkoutStates (work=%v rest=%v)", sawWork, sawRest)
+	}
+	if lastDistance <= 0 {
+		t.Error("expected Distance to have advanced")
+	}
+}
