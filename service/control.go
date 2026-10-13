@@ -231,6 +231,7 @@ const (
 	pmSetWorkoutType          = 0x01
 	pmSetWorkoutDuration      = 0x03
 	pmSetRestDuration         = 0x04
+	pmSetIntervalType         = 0x17 // CSAFE_PM_SET_INTERVALTYPE
 	pmSetWorkoutIntervalCount = 0x18 // CSAFE_PM_SET_WORKOUTINTERVALCOUNT
 
 	durationIdentifierTime     = 0x00 // hundredths of a second
@@ -279,6 +280,18 @@ func isIntervalWorkoutType(t byte) bool {
 	return false
 }
 
+// isRestUndefinedIntervalType reports whether an interval type (OBJ_INTERVALTYPE_T) is one of the
+// "rest undefined" variants.
+func isRestUndefinedIntervalType(t byte) bool {
+	switch t {
+	case config.INTERVALTYPE_TIMERESTUNDEFINED, config.INTERVALTYPE_DISTANCERESTUNDEFINED,
+		config.INTERVALTYPE_RESTUNDEFINED, config.INTERVALTYPE_CALRESTUNDEFINED,
+		config.INTERVALTYPE_WATTMINUTERESTUNDEFINED:
+		return true
+	}
+	return false
+}
+
 func isVariableWorkoutType(t byte) bool {
 	return t == config.WORKOUTTYPE_VARIABLE_INTERVAL || t == config.WORKOUTTYPE_VARIABLE_UNDEFINEDREST_INTERVAL
 }
@@ -288,7 +301,12 @@ func isVariableWorkoutType(t byte) bool {
 // workout, or once overall for a single/constant one -- see the type doc comment above). Must be
 // called with pmWorkoutMu held.
 func (w *pmWorkoutBuilder) commitInterval() {
-	w.current.RestUndefined = w.workoutType == config.WORKOUTTYPE_VARIABLE_UNDEFINEDREST_INTERVAL
+	// A client that sets the undefined-rest type first makes every interval undefined-rest; the
+	// spec's own sequence instead marks each interval by its interval type (see SET_INTERVALTYPE)
+	// and only switches the workout type once all intervals are configured.
+	if w.workoutType == config.WORKOUTTYPE_VARIABLE_UNDEFINEDREST_INTERVAL {
+		w.current.RestUndefined = true
+	}
 
 	if isVariableWorkoutType(w.workoutType) {
 		idx := 0
@@ -340,8 +358,20 @@ func applyPMConfig(machine *sm.StateMachine, sim *simulator.Simulator, data []by
 		switch {
 		case cmd == pmSetWorkoutType && len(payload) >= 1:
 			pmWorkoutMu.Lock()
-			pmWorkout = newPMWorkoutBuilder()
-			pmWorkout.workoutType = payload[0]
+			if payload[0] == config.WORKOUTTYPE_VARIABLE_UNDEFINEDREST_INTERVAL &&
+				isVariableWorkoutType(pmWorkout.workoutType) && len(pmWorkout.intervals) > 0 {
+				// The spec programs a variable workout that has undefined rests as variable
+				// intervals, then changes the type to undefined-rest once they are all configured
+				// (see "Variable Interval Undefined Rest"); that must not discard them.
+				pmWorkout.workoutType = payload[0]
+			} else {
+				pmWorkout = newPMWorkoutBuilder()
+				pmWorkout.workoutType = payload[0]
+			}
+			pmWorkoutMu.Unlock()
+		case cmd == pmSetIntervalType && len(payload) >= 1:
+			pmWorkoutMu.Lock()
+			pmWorkout.current.RestUndefined = isRestUndefinedIntervalType(payload[0])
 			pmWorkoutMu.Unlock()
 		case cmd == pmSetWorkoutDuration && len(payload) >= 5:
 			applyPMWorkoutDuration(payload)

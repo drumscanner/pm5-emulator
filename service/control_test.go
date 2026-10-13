@@ -172,3 +172,94 @@ func TestApplyPMConfig_VariableInterval(t *testing.T) {
 		t.Errorf("WorkoutState = %v, want INTERVALWORKDISTANCE (interval #1 is distance-based)", ws)
 	}
 }
+
+// The spec's "Variable Interval Undefined Rest" example (pages 96-97) of
+// docs/resources/Concept2 PM CSAFE Communication Definition.pdf programs the intervals as variable
+// intervals with "rest undefined" interval types and only then changes the workout type to
+// undefined-rest. That final type change must keep the intervals already configured.
+//
+//	Interval 1: 100m, interval 2: 2:00, both with undefined rest.
+func TestApplyPMConfig_VariableIntervalUndefinedRest(t *testing.T) {
+	configData := []byte{
+		0x18, 0x01, 0x00, // interval #1 (idx 0)
+		0x01, 0x01, 0x08, // SET_WORKOUTTYPE: WORKOUTTYPE_VARIABLE_INTERVAL
+		0x17, 0x01, 0x04, // SET_INTERVALTYPE: DISTANCERESTUNDEFINED
+		0x03, 0x05, 0x80, 0x00, 0x00, 0x00, 0x64, // distance, 100m
+		0x04, 0x02, 0x00, 0x00, // rest = 0
+		0x06, 0x04, 0x00, 0x00, 0x32, 0xC8, // SET_TARGETPACETIME (ignored)
+		0x14, 0x01, 0x01, // commit interval 0
+
+		0x18, 0x01, 0x01, // interval #2 (idx 1)
+		0x17, 0x01, 0x03, // TIMERESTUNDEFINED
+		0x03, 0x05, 0x00, 0x00, 0x00, 0x2E, 0xE0, // time, 2:00 (12000 centiseconds)
+		0x04, 0x02, 0x00, 0x00,
+		0x06, 0x04, 0x00, 0x00, 0x32, 0xC8,
+		0x14, 0x01, 0x01, // commit interval 1
+
+		0x01, 0x01, 0x09, // SET_WORKOUTTYPE: WORKOUTTYPE_VARIABLE_UNDEFINEDREST_INTERVAL
+		0x05, 0x05, 0x80, 0x00, 0x00, 0x00, 0x00, // SET_SPLITDURATION: 0m
+	}
+
+	machine, sim := newTestMachineAndSim()
+	applyPMConfig(machine, sim, configData)
+
+	pmWorkoutMu.Lock()
+	w := pmWorkout
+	pmWorkoutMu.Unlock()
+
+	if w.workoutType != config.WORKOUTTYPE_VARIABLE_UNDEFINEDREST_INTERVAL {
+		t.Fatalf("workoutType = %v, want VARIABLE_UNDEFINEDREST_INTERVAL", w.workoutType)
+	}
+	if len(w.intervals) != 2 {
+		t.Fatalf("intervals = %+v, want exactly 2", w.intervals)
+	}
+	if got := w.intervals[0]; got.DurationType != config.CSAFE_DISTANCE_DURATION || got.TargetDistance != 100 || !got.RestUndefined {
+		t.Errorf("interval[0] = %+v, want 100m with undefined rest", got)
+	}
+	if got := w.intervals[1]; got.DurationType != config.CSAFE_TIME_DURATION || got.TargetDuration != 120*time.Second || !got.RestUndefined {
+		t.Errorf("interval[1] = %+v, want 2:00 with undefined rest", got)
+	}
+
+	applyPMConfig(machine, sim, []byte{0x13, 0x02, 0x01, 0x01})
+	if machine.GetStateName() != config.PM5_STATE_INUSE {
+		t.Fatalf("state = %s, want INUSE after PREPARETOROWWORKOUT", machine.GetStateName())
+	}
+}
+
+// A mix of timed and undefined rests is programmed the same way; only the intervals whose type is
+// a "rest undefined" variant are undefined.
+func TestApplyPMConfig_VariableIntervalMixedRest(t *testing.T) {
+	configData := []byte{
+		0x18, 0x01, 0x00,
+		0x01, 0x01, 0x08,
+		0x17, 0x01, 0x01, // DIST, with a rest
+		0x03, 0x05, 0x80, 0x00, 0x00, 0x01, 0xF4,
+		0x04, 0x02, 0x00, 0x3C,
+		0x14, 0x01, 0x01,
+
+		0x18, 0x01, 0x01,
+		0x17, 0x01, 0x03, // TIMERESTUNDEFINED
+		0x03, 0x05, 0x00, 0x00, 0x00, 0x2E, 0xE0,
+		0x04, 0x02, 0x00, 0x00,
+		0x14, 0x01, 0x01,
+
+		0x01, 0x01, 0x09,
+	}
+
+	machine, sim := newTestMachineAndSim()
+	applyPMConfig(machine, sim, configData)
+
+	pmWorkoutMu.Lock()
+	w := pmWorkout
+	pmWorkoutMu.Unlock()
+
+	if len(w.intervals) != 2 {
+		t.Fatalf("intervals = %+v, want exactly 2", w.intervals)
+	}
+	if w.intervals[0].RestUndefined || w.intervals[0].RestDuration != 60*time.Second {
+		t.Errorf("interval[0] = %+v, want a 60s rest", w.intervals[0])
+	}
+	if !w.intervals[1].RestUndefined {
+		t.Errorf("interval[1] = %+v, want an undefined rest", w.intervals[1])
+	}
+}
