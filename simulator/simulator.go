@@ -25,7 +25,17 @@ type WorkoutConfig struct {
 	TargetDistance float64       // meters, 0 = unlimited ("just row")
 	TargetDuration time.Duration // 0 = unlimited
 	TargetPaceSec  float64       // seconds per 500m; 0 = keep current pace
+	TargetCalories float64       // calories of one interval, for calorie intervals
+
+	// Interval workouts repeat the goal above, with a rest between repetitions, until terminated.
+	// The rower keeps rowing through the rest, so distance, time and calories keep accumulating.
+	Interval      bool
+	RestDuration  time.Duration
+	RestUndefined bool // no set rest length; the emulator rests for undefinedRestDuration
 }
+
+// How long a rest without a set length lasts here; a real PM5 waits for the rower to start again.
+const undefinedRestDuration = 10 * time.Second
 
 // Simulator drives a physics-based "steady state with light jitter" row: it
 // advances LiveState over time whenever the shared state machine reports
@@ -48,6 +58,16 @@ type Simulator struct {
 	lastSplitDistance float64
 	lastSplitElapsed  time.Duration
 	strokePhase       time.Duration
+
+	// Interval workouts: the current work or rest phase and where it began.
+	interval       bool
+	targetCalories float64
+	restDuration   time.Duration
+	restUndefined  bool
+	inRest         bool
+	phaseElapsed   time.Duration
+	phaseDistance  float64
+	phaseCalories  float64
 
 	rng *rand.Rand
 
@@ -219,6 +239,10 @@ func (s *Simulator) ConfigureWorkout(cfg WorkoutConfig) {
 	s.durationType = cfg.DurationType
 	s.targetDistance = cfg.TargetDistance
 	s.targetDuration = cfg.TargetDuration
+	s.targetCalories = cfg.TargetCalories
+	s.interval = cfg.Interval
+	s.restDuration = cfg.RestDuration
+	s.restUndefined = cfg.RestUndefined
 	if cfg.TargetPaceSec > 0 {
 		s.targetSplitSec = cfg.TargetPaceSec
 	}
@@ -238,6 +262,10 @@ func (s *Simulator) resetLocked() {
 	s.lastSplitDistance = 0
 	s.lastSplitElapsed = 0
 	s.strokePhase = 0
+	s.inRest = false
+	s.phaseElapsed = 0
+	s.phaseDistance = 0
+	s.phaseCalories = 0
 }
 
 // newLiveState returns the correct "nothing happening yet" defaults: heart
@@ -323,8 +351,88 @@ func (s *Simulator) tick(dt time.Duration) {
 	s.state.RowingState = config.ROWINGSTATE_ACTIVE
 
 	s.updateStroke(dt, speed, power)
+	if s.interval {
+		s.updateInterval()
+		return
+	}
 	s.updateSplit()
 	s.checkWorkoutComplete()
+}
+
+// updateInterval runs the work and rest phases of an interval workout. Time, distance and
+// calories keep accumulating through the rest, as the rower goes on rowing; the rest only changes
+// the reported workout state and interval type, and counts its own time and distance.
+func (s *Simulator) updateInterval() {
+	if s.state.IntervalCount == 0 {
+		s.state.IntervalCount = 1
+	}
+	phaseTime := s.state.ElapsedTime - s.phaseElapsed
+	phaseDistance := s.state.Distance - s.phaseDistance
+	phaseCalories := s.state.TotalCalories - s.phaseCalories
+
+	if s.inRest {
+		s.state.WorkoutState = config.WORKOUTSTATE_INTERVALREST
+		s.state.IntervalType = config.INTERVALTYPE_REST
+		s.state.RestTime = phaseTime
+		s.state.RestDistance = phaseDistance
+		rest := s.restDuration
+		if s.restUndefined {
+			s.state.IntervalType = config.INTERVALTYPE_RESTUNDEFINED
+			rest = undefinedRestDuration
+		}
+		if phaseTime >= rest {
+			s.inRest = false
+			s.state.IntervalCount++
+			s.beginPhase()
+		}
+		return
+	}
+
+	switch s.durationType {
+	case config.CSAFE_DISTANCE_DURATION:
+		s.state.WorkoutState = config.WORKOUTSTATE_INTERVALWORKDISTANCE
+		s.state.IntervalType = config.INTERVALTYPE_DIST
+	case config.CSAFE_CALORIES_DURATION:
+		s.state.WorkoutState = config.WORKOUTSTATE_INTERVALWORKDISTANCE
+		s.state.IntervalType = config.INTERVALTYPE_CAL
+	default:
+		s.state.WorkoutState = config.WORKOUTSTATE_INTERVALWORKTIME
+		s.state.IntervalType = config.INTERVALTYPE_TIME
+	}
+	if s.restUndefined {
+		switch s.state.IntervalType {
+		case config.INTERVALTYPE_TIME:
+			s.state.IntervalType = config.INTERVALTYPE_TIMERESTUNDEFINED
+		case config.INTERVALTYPE_DIST:
+			s.state.IntervalType = config.INTERVALTYPE_DISTANCERESTUNDEFINED
+		case config.INTERVALTYPE_CAL:
+			s.state.IntervalType = config.INTERVALTYPE_CALRESTUNDEFINED
+		}
+	}
+	s.state.RestTime = 0
+	s.state.RestDistance = 0
+
+	done := false
+	switch s.durationType {
+	case config.CSAFE_DISTANCE_DURATION:
+		done = phaseDistance >= s.targetDistance
+	case config.CSAFE_CALORIES_DURATION:
+		done = phaseCalories >= s.targetCalories
+	default:
+		done = phaseTime >= s.targetDuration
+	}
+	if done {
+		s.inRest = true
+		s.state.WorkoutState = config.WORKOUTSTATE_INTERVALREST
+		s.state.IntervalType = config.INTERVALTYPE_REST
+		s.beginPhase()
+	}
+}
+
+func (s *Simulator) beginPhase() {
+	s.phaseElapsed = s.state.ElapsedTime
+	s.phaseDistance = s.state.Distance
+	s.phaseCalories = s.state.TotalCalories
 }
 
 func (s *Simulator) updateStroke(dt time.Duration, speed, power float64) {

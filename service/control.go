@@ -230,6 +230,8 @@ const (
 const (
 	pmSetWorkoutType     = 0x01
 	pmSetWorkoutDuration = 0x03
+	pmSetRestDuration    = 0x04
+	pmSetIntervalID      = 0x07
 
 	durationIdentifierTime     = 0x00 // hundredths of a second
 	durationIdentifierCalories = 0x40
@@ -254,7 +256,8 @@ var (
 //     Terminate -> Rearm -> WaitToBegin, i.e. back to the idle state, which also stops the
 //     simulator.
 //
-// Rest durations and splits are accepted but not modeled.
+// Interval workouts (fixed time, distance and calorie intervals, and the undefined-rest variable
+// type holding one interval) repeat with their rest until terminated. Splits are not modeled.
 func applyPMConfig(machine *sm.StateMachine, sim *simulator.Simulator, data []byte) {
 	for i := 0; i+1 < len(data); {
 		cmd, n := data[i], int(data[i+1])
@@ -268,9 +271,24 @@ func applyPMConfig(machine *sm.StateMachine, sim *simulator.Simulator, data []by
 		case cmd == pmSetWorkoutType && len(payload) >= 1:
 			pmWorkoutMu.Lock()
 			pmWorkoutConfig = simulator.WorkoutConfig{WorkoutType: payload[0]}
+			switch payload[0] {
+			case config.WORKOUTTYPE_FIXEDTIME_INTERVAL, config.WORKOUTTYPE_FIXEDDIST_INTERVAL,
+				config.WORKOUTTYPE_FIXEDCALS_INTERVAL:
+				pmWorkoutConfig.Interval = true
+			case config.WORKOUTTYPE_VARIABLE_UNDEFINEDREST_INTERVAL:
+				// Only the one interval a client programs is modeled, repeated.
+				pmWorkoutConfig.Interval = true
+				pmWorkoutConfig.RestUndefined = true
+			}
 			pmWorkoutMu.Unlock()
 		case cmd == pmSetWorkoutDuration && len(payload) >= 5:
 			applyPMWorkoutDuration(payload)
+		case cmd == pmSetRestDuration && len(payload) >= 2:
+			pmWorkoutMu.Lock()
+			pmWorkoutConfig.RestDuration = time.Duration(uint16(payload[0])<<8|uint16(payload[1])) * time.Second
+			pmWorkoutMu.Unlock()
+		case cmd == pmSetIntervalID:
+			// A single interval is modeled; the identifier is accepted and ignored.
 		case cmd == byte(csafe.PM_SET_SCREENSTATE) && len(payload) >= 2 && payload[0] == screenTypeWorkout:
 			switch payload[1] {
 			case screenValueTerminateWorkout:
@@ -297,7 +315,8 @@ func applyPMWorkoutDuration(payload []byte) {
 		pmWorkoutConfig.DurationType = config.CSAFE_DISTANCE_DURATION
 		pmWorkoutConfig.TargetDistance = float64(value)
 	case durationIdentifierCalories:
-		// Calorie goals aren't modeled; the workout runs without an end.
+		pmWorkoutConfig.DurationType = config.CSAFE_CALORIES_DURATION
+		pmWorkoutConfig.TargetCalories = float64(value)
 	}
 }
 
